@@ -65,7 +65,7 @@ _prepared_key_file = None
 
 def on_starting(server):
     # First-Party
-    from cyberfraud import env
+    import cyberfraud.env as env
     if os.environ.get("PROTETED_SECRETS", "false").lower() == "true":
         print(env.get_config())
     """Called just before the master process is initialized.
