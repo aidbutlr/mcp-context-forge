@@ -64,8 +64,10 @@ _prepared_key_file = None
 
 
 def on_starting(server):
-    import cyberfraud.env
-    print(env.get_config())
+    if os.environ.get("PROTETED_SECRETS", "false").lower() == "true":
+        # First-Party
+        from cyberfraud import env
+        print(env.get_config())
     """Called just before the master process is initialized.
 
     This is where we handle passphrase-protected SSL keys by decrypting
@@ -80,6 +82,7 @@ def on_starting(server):
 
     if ssl_enabled and ssl_key_password:
         try:
+            # First-Party
             from mcpgateway.utils.ssl_key_manager import prepare_ssl_key
 
             # Get the key file path from environment (set by run-gunicorn.sh)
@@ -113,6 +116,7 @@ def post_fork(server, worker):
     # This is necessary because --preload causes the client to be initialized
     # in the master process, but each forked worker needs its own event loop
     try:
+        # First-Party
         from mcpgateway.utils.redis_client import _reset_client
         _reset_client()
     except ImportError:
