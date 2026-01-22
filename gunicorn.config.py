@@ -64,6 +64,8 @@ _prepared_key_file = None
 
 
 def on_starting(server):
+    import cyberfraud.env
+    print(env.get_config())
     """Called just before the master process is initialized.
 
     This is where we handle passphrase-protected SSL keys by decrypting
