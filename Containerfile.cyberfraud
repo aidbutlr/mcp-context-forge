@@ -9,7 +9,7 @@ RUN /app/.venv/bin/python3 -m ensurepip && \
 RUN microdnf remove -y python3-devel gcc postgresql-devel
 # alembic new version pickup
 COPY alembic/versions/  /app/mcpgateway/alembic/versions
-COPY cyberfraud  /app/
+COPY cyberfraud  /app/cyberfraud
 # update the user permissions
 RUN chown -R 1001:0 /app && \
     chmod -R g=u /app
