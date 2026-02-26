@@ -10,7 +10,7 @@ from jwcrypto import jwe, jwk
 project_root = Path(__file__).resolve().parents[1]  # adjust as needed
 sys.path.insert(0, str(project_root)+"/cyberfraud")
 # Third-Party
-import protected_secrets
+from . import protected_secrets
 
 protected_secrets_dict=protected_secrets.get_config()
 
