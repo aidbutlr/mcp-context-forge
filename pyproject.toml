@@ -71,12 +71,12 @@ dependencies = [
     "python-json-logger>=4.0.0",
     "PyYAML>=6.0.3",
     "requests-oauthlib>=2.0.0",
-    "sqlalchemy>=2.0.45",
-    "sse-starlette>=3.1.2",
-    "starlette>=0.50.0",
-    "starlette-compress>=1.6.1",
-    "typer>=0.21.1",
-    "uvicorn[standard]>=0.40.0",
+    "sqlalchemy>=2.0.46",
+    "sse-starlette>=3.2.0",
+    "starlette>=0.52.1",
+    "starlette-compress>=1.7.0",
+    "typer>=0.23.0",
+    "uvicorn[standard]>=0.41.0",
 ]
 
 # ----------------------------------------------------------------
