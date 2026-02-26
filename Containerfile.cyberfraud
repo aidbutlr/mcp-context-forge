@@ -8,6 +8,7 @@ RUN /app/.venv/bin/python3 -m ensurepip && \
     /app/.venv/bin/python3 -m pip install 'jwcrypto'
 RUN microdnf remove -y python3-devel gcc postgresql-devel
 COPY cyberfraud/*  /app/mcpgateway
+RUN cp /app/mcpgateway/__init__.py /app/mcpgateway/__init__.py.bck
 RUN echo "from . import cyberfraud_proteted_secrets_adapter" >> /app/mcpgateway/__init__.py
 # update the user permissions
 RUN chown -R 1001:0 /app && \
