@@ -12,8 +12,10 @@ retrieval, updates, activation toggling, and deletion.
 """
 
 # Standard
+import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 try:
     # Third-Party
@@ -29,14 +31,17 @@ except ImportError:
     reflection_pb2_grpc = None  # type: ignore
 
 # Third-Party
+from pydantic import ValidationError
 from sqlalchemy import and_, desc, select
 from sqlalchemy.orm import Session
 
 # First-Party
+from mcpgateway.db import EmailTeam
 from mcpgateway.db import GrpcService as DbGrpcService
 from mcpgateway.schemas import GrpcServiceCreate, GrpcServiceRead, GrpcServiceUpdate
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.services.team_management_service import TeamManagementService
+from mcpgateway.utils.pagination import unified_paginate
 
 # Initialize logging
 logging_service = LoggingService()
@@ -127,9 +132,9 @@ class GrpcService:
         # Set audit metadata if provided
         if metadata:
             db_service.created_by = user_email
-            db_service.created_from_ip = metadata.get("ip")
-            db_service.created_via = metadata.get("via")
-            db_service.created_user_agent = metadata.get("user_agent")
+            db_service.created_from_ip = metadata.get("created_from_ip")
+            db_service.created_via = metadata.get("created_via")
+            db_service.created_user_agent = metadata.get("created_user_agent")
 
         db.add(db_service)
         db.commit()
@@ -149,22 +154,32 @@ class GrpcService:
     async def list_services(
         self,
         db: Session,
+        cursor: Optional[str] = None,
         include_inactive: bool = False,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        per_page: Optional[int] = None,
         user_email: Optional[str] = None,
         team_id: Optional[str] = None,
-    ) -> List[GrpcServiceRead]:
-        """List gRPC services with optional filtering.
+    ) -> Union[tuple[List[GrpcServiceRead], Optional[str]], Dict[str, Any]]:
+        """List gRPC services with pagination and optional filtering.
 
         Args:
             db: Database session
+            cursor: Pagination cursor for keyset pagination
             include_inactive: Include disabled services
+            limit: Maximum number of services to return. None for default, 0 for unlimited
+            page: Page number for page-based pagination (1-indexed). Mutually exclusive with cursor
+            per_page: Items per page for page-based pagination
             user_email: Filter by user email for team access control
             team_id: Filter by team ID
 
         Returns:
-            List of gRPC services
+            If page is provided: Dict with {"data": [...], "pagination": {...}, "links": {...}}
+            If cursor is provided or neither: tuple of (list of GrpcServiceRead objects, next_cursor)
         """
-        query = select(DbGrpcService)
+        # Build base query with ordering
+        query = select(DbGrpcService).order_by(desc(DbGrpcService.created_at), desc(DbGrpcService.id))
 
         # Apply team filtering
         if user_email and team_id:
@@ -179,10 +194,56 @@ class GrpcService:
         if not include_inactive:
             query = query.where(DbGrpcService.enabled.is_(True))  # pylint: disable=singleton-comparison
 
-        query = query.order_by(desc(DbGrpcService.created_at))
+        # Use unified pagination helper - handles both page and cursor pagination
+        pag_result = await unified_paginate(
+            db=db,
+            query=query,
+            page=page,
+            per_page=per_page,
+            cursor=cursor,
+            limit=limit,
+            base_url="/admin/grpc",
+            query_params={"include_inactive": include_inactive} if include_inactive else {},
+        )
 
-        services = db.execute(query).scalars().all()
-        return [GrpcServiceRead.model_validate(svc) for svc in services]
+        next_cursor = None
+        # Extract services based on pagination type
+        if page is not None:
+            # Page-based: pag_result is a dict
+            services_db = pag_result["data"]
+        else:
+            # Cursor-based: pag_result is a tuple
+            services_db, next_cursor = pag_result
+
+        # Fetch team names for the services
+        team_ids_set = {s.team_id for s in services_db if s.team_id}
+        team_map = {}
+        if team_ids_set:
+            teams = db.execute(select(EmailTeam.id, EmailTeam.name).where(EmailTeam.id.in_(team_ids_set), EmailTeam.is_active.is_(True))).all()
+            team_map = {team.id: team.name for team in teams}
+
+        db.commit()  # Release transaction to avoid idle-in-transaction
+
+        # Convert to GrpcServiceRead
+        result = []
+        for s in services_db:
+            try:
+                s.team = team_map.get(s.team_id) if s.team_id else None
+                result.append(GrpcServiceRead.model_validate(s))
+            except (ValidationError, ValueError, KeyError, TypeError) as e:
+                logger.exception(f"Failed to convert gRPC service {getattr(s, 'id', 'unknown')} ({getattr(s, 'name', 'unknown')}): {e}")
+
+        # Return appropriate format based on pagination type
+        if page is not None:
+            # Page-based format
+            return {
+                "data": result,
+                "pagination": pag_result["pagination"],
+                "links": pag_result["links"],
+            }
+
+        # Cursor-based format (tuple)
+        return (result, next_cursor)
 
     async def get_service(
         self,
@@ -265,9 +326,9 @@ class GrpcService:
         # Set audit metadata
         if metadata and user_email:
             service.modified_by = user_email
-            service.modified_from_ip = metadata.get("ip")
-            service.modified_via = metadata.get("via")
-            service.modified_user_agent = metadata.get("user_agent")
+            service.modified_from_ip = metadata.get("modified_from_ip")
+            service.modified_via = metadata.get("modified_via")
+            service.modified_user_agent = metadata.get("modified_user_agent")
 
         service.version += 1
 
@@ -278,13 +339,13 @@ class GrpcService:
 
         return GrpcServiceRead.model_validate(service)
 
-    async def toggle_service(
+    async def set_service_state(
         self,
         db: Session,
         service_id: str,
         activate: bool,
     ) -> GrpcServiceRead:
-        """Toggle a gRPC service's enabled status.
+        """Set a gRPC service's enabled status.
 
         Args:
             db: Database session
@@ -432,10 +493,8 @@ class GrpcService:
             if service.tls_cert_path and service.tls_key_path:
                 # Load TLS certificates
                 try:
-                    with open(service.tls_cert_path, "rb") as f:
-                        cert = f.read()
-                    with open(service.tls_key_path, "rb") as f:
-                        key = f.read()
+                    cert = await asyncio.to_thread(Path(service.tls_cert_path).read_bytes)
+                    key = await asyncio.to_thread(Path(service.tls_key_path).read_bytes)
                     credentials = grpc.ssl_channel_credentials(root_certificates=cert, private_key=key)
                 except FileNotFoundError as e:
                     raise GrpcServiceError(f"TLS certificate or key file not found: {e}")

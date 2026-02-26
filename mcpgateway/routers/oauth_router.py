@@ -13,8 +13,10 @@ This module handles OAuth 2.0 Authorization Code flow endpoints including:
 """
 
 # Standard
+from html import escape
 import logging
-from typing import Any, Dict
+from typing import Annotated, Any, Dict
+from urllib.parse import urlparse, urlunparse
 
 # Third-Party
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -32,6 +34,38 @@ from mcpgateway.services.oauth_manager import OAuthError, OAuthManager
 from mcpgateway.services.token_storage_service import TokenStorageService
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_resource_url(url: str | None, *, preserve_query: bool = False) -> str | None:
+    """Normalize URL for use as RFC 8707 resource parameter.
+
+    Per RFC 8707 Section 2:
+    - resource MUST be an absolute URI (scheme required; supports both URLs and URNs)
+    - resource MUST NOT include a fragment component
+    - resource SHOULD NOT include a query component (but allowed when necessary)
+
+    Args:
+        url: The resource URL to normalize
+        preserve_query: If True, preserve query component (for explicitly configured resources).
+                       If False, strip query (for auto-derived resources per RFC 8707 SHOULD NOT).
+
+    Returns:
+        Normalized URL suitable for RFC 8707 resource parameter, or None if invalid
+    """
+    if not url:
+        return None
+    parsed = urlparse(url)
+    # RFC 8707: resource MUST be an absolute URI (requires scheme)
+    # Support both hierarchical URIs (https://...) and URNs (urn:example:app)
+    if not parsed.scheme:
+        logger.warning(f"Invalid resource URL (must be absolute URI with scheme): {url}")
+        return None
+    # Remove fragment (MUST NOT per RFC 8707)
+    # Query: strip for auto-derived (SHOULD NOT), preserve for explicit config (allowed when necessary)
+    query = parsed.query if preserve_query else ""
+    normalized = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, ""))
+    return normalized
+
 
 oauth_router = APIRouter(prefix="/oauth", tags=["oauth"])
 
@@ -76,6 +110,25 @@ async def initiate_oauth_flow(
         if not gateway:
             raise HTTPException(status_code=404, detail="Gateway not found")
 
+        # Check gateway access permission
+        # Admins can access any gateway; otherwise check team membership if gateway has team_id
+        user_email = current_user.email if hasattr(current_user, "email") else current_user.get("email")
+        is_admin = current_user.is_admin if hasattr(current_user, "is_admin") else current_user.get("is_admin", False)
+
+        # Get team_id safely (may not exist on all gateway objects)
+        gateway_team_id = getattr(gateway, "team_id", None)
+
+        if not is_admin and gateway_team_id:
+            # Import here to avoid circular imports
+            # First-Party
+            from mcpgateway.services.email_auth_service import EmailAuthService
+
+            auth_service = EmailAuthService(db)
+            user = await auth_service.get_user_by_email(user_email)
+            if not user or not user.is_team_member(gateway_team_id):
+                logger.warning(f"OAuth access denied: user {user_email} not member of gateway team {gateway_team_id}")
+                raise HTTPException(status_code=403, detail="You don't have access to this gateway")
+
         if not gateway.oauth_config:
             raise HTTPException(status_code=400, detail="Gateway is not configured for OAuth")
 
@@ -83,6 +136,24 @@ async def initiate_oauth_flow(
             raise HTTPException(status_code=400, detail="Gateway is not configured for Authorization Code flow")
 
         oauth_config = gateway.oauth_config.copy()  # Work with a copy to avoid mutating the original
+
+        # RFC 8707: Set resource parameter for JWT access tokens
+        # Respect pre-configured resource (e.g., for providers requiring pre-registered resources)
+        # Only derive from gateway.url if not explicitly configured
+        if oauth_config.get("resource"):
+            # Normalize existing resource - preserve query for explicit config (RFC 8707 allows when necessary)
+            existing = oauth_config["resource"]
+            if isinstance(existing, list):
+                original_count = len(existing)
+                normalized = [_normalize_resource_url(r, preserve_query=True) for r in existing]
+                oauth_config["resource"] = [r for r in normalized if r]
+                if not oauth_config["resource"] and original_count > 0:
+                    logger.warning(f"All {original_count} configured resource values were invalid and removed")
+            else:
+                oauth_config["resource"] = _normalize_resource_url(existing, preserve_query=True)
+        else:
+            # Default to gateway.url as the resource (strip query per RFC 8707 SHOULD NOT)
+            oauth_config["resource"] = _normalize_resource_url(gateway.url)
 
         # Phase 1.4: Auto-trigger DCR if credentials are missing
         # Check if gateway has issuer but no client_id (DCR scenario)
@@ -116,7 +187,7 @@ async def initiate_oauth_flow(
                         from mcpgateway.services.encryption_service import get_encryption_service
 
                         encryption = get_encryption_service(settings.auth_encryption_secret)
-                        decrypted_secret = encryption.decrypt_secret(registered_client.client_secret_encrypted)
+                        decrypted_secret = await encryption.decrypt_secret_async(registered_client.client_secret_encrypted)
 
                     # Update oauth_config with registered credentials
                     oauth_config["client_id"] = registered_client.client_id
@@ -177,8 +248,10 @@ async def initiate_oauth_flow(
 
 @oauth_router.get("/callback")
 async def oauth_callback(
-    code: str = Query(..., description="Authorization code from OAuth provider"),
-    state: str = Query(..., description="State parameter for CSRF protection"),
+    code: Annotated[str | None, Query(description="Authorization code from OAuth provider")] = None,
+    state: Annotated[str, Query(description="State parameter for CSRF protection")] = ...,
+    error: Annotated[str | None, Query(description="OAuth provider error code")] = None,
+    error_description: Annotated[str | None, Query(description="OAuth provider error description")] = None,
     # Remove the gateway_id parameter requirement
     request: Request = None,
     db: Session = Depends(get_db),
@@ -192,6 +265,8 @@ async def oauth_callback(
     Args:
         code (str): The authorization code returned by the OAuth provider.
         state (str): The state parameter for CSRF protection, which encodes the gateway ID.
+        error (str): OAuth provider error code from error callback (RFC 6749 Section 4.1.2.1).
+        error_description (str): OAuth provider error description.
         request (Request): The incoming HTTP request object.
         db (Session): The database session dependency.
 
@@ -210,6 +285,45 @@ async def oauth_callback(
     try:
         # Get root path for URL construction
         root_path = request.scope.get("root_path", "") if request else ""
+        safe_root_path = escape(str(root_path), quote=True)
+
+        # RFC 6749 Section 4.1.2.1: provider may return error instead of code
+        if error:
+            error_text = escape(error)
+            description_text = escape(error_description or "OAuth provider returned an authorization error.")
+            logger.warning(f"OAuth provider returned error callback: error={error}, description={error_description}")
+            return HTMLResponse(
+                content=f"""
+                <!DOCTYPE html>
+                <html>
+                <head><title>OAuth Authorization Failed</title></head>
+                <body>
+                    <h1>❌ OAuth Authorization Failed</h1>
+                    <p><strong>Error:</strong> {error_text}</p>
+                    <p><strong>Description:</strong> {description_text}</p>
+                    <a href="{safe_root_path}/admin#gateways">Return to Admin Panel</a>
+                </body>
+                </html>
+                """,
+                status_code=400,
+            )
+
+        if not code:
+            logger.warning("OAuth callback missing authorization code")
+            return HTMLResponse(
+                content=f"""
+                <!DOCTYPE html>
+                <html>
+                <head><title>OAuth Authorization Failed</title></head>
+                <body>
+                    <h1>❌ OAuth Authorization Failed</h1>
+                    <p>Error: Missing authorization code in callback response.</p>
+                    <a href="{safe_root_path}/admin#gateways">Return to Admin Panel</a>
+                </body>
+                </html>
+                """,
+                status_code=400,
+            )
 
         # Extract gateway_id from state parameter
         # Try new base64-encoded JSON format first
@@ -251,14 +365,14 @@ async def oauth_callback(
 
         if not gateway:
             return HTMLResponse(
-                content="""
+                content=f"""
                 <!DOCTYPE html>
                 <html>
                 <head><title>OAuth Authorization Failed</title></head>
                 <body>
                     <h1>❌ OAuth Authorization Failed</h1>
                     <p>Error: Gateway not found</p>
-                    <a href="{root_path}/admin#gateways">Return to Admin Panel</a>
+                    <a href="{safe_root_path}/admin#gateways">Return to Admin Panel</a>
                 </body>
                 </html>
                 """,
@@ -267,14 +381,14 @@ async def oauth_callback(
 
         if not gateway.oauth_config:
             return HTMLResponse(
-                content="""
+                content=f"""
                 <!DOCTYPE html>
                 <html>
                 <head><title>OAuth Authorization Failed</title></head>
                 <body>
                     <h1>❌ OAuth Authorization Failed</h1>
                     <p>Error: Gateway has no OAuth configuration</p>
-                    <a href="{root_path}/admin#gateways">Return to Admin Panel</a>
+                    <a href="{safe_root_path}/admin#gateways">Return to Admin Panel</a>
                 </body>
                 </html>
                 """,
@@ -284,7 +398,27 @@ async def oauth_callback(
         # Complete OAuth flow
         oauth_manager = OAuthManager(token_storage=TokenStorageService(db))
 
-        result = await oauth_manager.complete_authorization_code_flow(gateway_id, code, state, gateway.oauth_config)
+        # RFC 8707: Add resource parameter for JWT access tokens
+        # Must be set here in callback, not just in /authorize, because complete_authorization_code_flow
+        # needs it for the token exchange request
+        # Respect pre-configured resource; only derive from gateway.url if not explicitly configured
+        oauth_config_with_resource = gateway.oauth_config.copy()
+        if oauth_config_with_resource.get("resource"):
+            # Preserve query for explicit config (RFC 8707 allows when necessary)
+            existing = oauth_config_with_resource["resource"]
+            if isinstance(existing, list):
+                original_count = len(existing)
+                normalized = [_normalize_resource_url(r, preserve_query=True) for r in existing]
+                oauth_config_with_resource["resource"] = [r for r in normalized if r]
+                if not oauth_config_with_resource["resource"] and original_count > 0:
+                    logger.warning(f"All {original_count} configured resource values were invalid and removed")
+            else:
+                oauth_config_with_resource["resource"] = _normalize_resource_url(existing, preserve_query=True)
+        else:
+            # Strip query for auto-derived (RFC 8707 SHOULD NOT)
+            oauth_config_with_resource["resource"] = _normalize_resource_url(gateway.url)
+
+        result = await oauth_manager.complete_authorization_code_flow(gateway_id, code, state, oauth_config_with_resource)
 
         logger.info(f"Completed OAuth flow for gateway {gateway_id}, user {result.get('user_id')}")
 
@@ -315,9 +449,9 @@ async def oauth_callback(
         <body>
             <h1 class="success">✅ OAuth Authorization Successful</h1>
             <div class="info">
-                <p><strong>Gateway:</strong> {gateway.name}</p>
-                <p><strong>User ID:</strong> {result.get("user_id", "Unknown")}</p>
-                <p><strong>Expires:</strong> {result.get("expires_at", "Unknown")}</p>
+                <p><strong>Gateway:</strong> {escape(str(gateway.name))}</p>
+                <p><strong>User ID:</strong> {escape(str(result.get("user_id", "Unknown")))}</p>
+                <p><strong>Expires:</strong> {escape(str(result.get("expires_at", "Unknown")))}</p>
                 <p><strong>Status:</strong> Authorization completed successfully</p>
             </div>
 
@@ -330,7 +464,7 @@ async def oauth_callback(
                 <div id="fetch-status" style="margin-top: 15px;"></div>
             </div>
 
-            <a href="{root_path}/admin#gateways" class="button">Return to Admin Panel</a>
+            <a href="{safe_root_path}/admin#gateways" class="button">Return to Admin Panel</a>
 
             <script>
             async function fetchTools() {{
@@ -342,7 +476,7 @@ async def oauth_callback(
                 statusDiv.innerHTML = '<p style="color: #2563eb;">Fetching tools from MCP server...</p>';
 
                 try {{
-                    const response = await fetch('{root_path}/oauth/fetch-tools/{gateway_id}', {{
+                    const response = await fetch('{safe_root_path}/oauth/fetch-tools/{escape(str(gateway_id))}', {{
                         method: 'POST'
                     }});
 
@@ -404,9 +538,9 @@ async def oauth_callback(
         </head>
         <body>
             <h1 class="error">❌ OAuth Authorization Failed</h1>
-            <p><strong>Error:</strong> {str(e)}</p>
+            <p><strong>Error:</strong> {escape(str(e))}</p>
             <p>Please check your OAuth configuration and try again.</p>
-            <a href="{root_path}/admin#gateways" class="button">Return to Admin Panel</a>
+            <a href="{safe_root_path}/admin#gateways" class="button">Return to Admin Panel</a>
         </body>
         </html>
         """,
@@ -438,9 +572,9 @@ async def oauth_callback(
         </head>
         <body>
             <h1 class="error">❌ OAuth Authorization Failed</h1>
-            <p><strong>Unexpected Error:</strong> {str(e)}</p>
+            <p><strong>Unexpected Error:</strong> {escape(str(e))}</p>
             <p>Please contact your administrator for assistance.</p>
-            <a href="{root_path}/admin#gateways" class="button">Return to Admin Panel</a>
+            <a href="{safe_root_path}/admin#gateways" class="button">Return to Admin Panel</a>
         </body>
         </html>
         """,
@@ -449,18 +583,26 @@ async def oauth_callback(
 
 
 @oauth_router.get("/status/{gateway_id}")
-async def get_oauth_status(gateway_id: str, db: Session = Depends(get_db)) -> dict:
+async def get_oauth_status(
+    gateway_id: str,
+    current_user: dict = Depends(get_current_user_with_permissions),
+    db: Session = Depends(get_db),
+) -> dict:
     """Get OAuth status for a gateway.
+
+    Requires authentication and authorization to prevent information disclosure
+    about gateway OAuth configuration (client IDs, scopes, etc.).
 
     Args:
         gateway_id: ID of the gateway
+        current_user: Authenticated user (enforces authentication)
         db: Database session
 
     Returns:
         OAuth status information
 
     Raises:
-        HTTPException: If gateway not found or error retrieving status
+        HTTPException: If not authenticated, not authorized, gateway not found, or error
     """
     try:
         # Get gateway configuration
@@ -468,6 +610,24 @@ async def get_oauth_status(gateway_id: str, db: Session = Depends(get_db)) -> di
 
         if not gateway:
             raise HTTPException(status_code=404, detail="Gateway not found")
+
+        # Check team-based authorization (same pattern as initiate_oauth_flow)
+        user_email = current_user.get("email") if isinstance(current_user, dict) else getattr(current_user, "email", None)
+        is_admin = current_user.get("is_admin", False) if isinstance(current_user, dict) else getattr(current_user, "is_admin", False)
+        # Also check nested user.is_admin for JWT tokens
+        if isinstance(current_user, dict) and not is_admin:
+            is_admin = current_user.get("user", {}).get("is_admin", False)
+
+        gateway_team_id = getattr(gateway, "team_id", None)
+
+        if not is_admin and gateway_team_id:
+            # First-Party
+            from mcpgateway.services.email_auth_service import EmailAuthService
+
+            auth_service = EmailAuthService(db)
+            user = await auth_service.get_user_by_email(user_email)
+            if not user or not user.is_team_member(gateway_team_id):
+                raise HTTPException(status_code=403, detail="You don't have access to this gateway")
 
         if not gateway.oauth_config:
             return {"oauth_enabled": False, "message": "Gateway is not configured for OAuth"}
@@ -675,6 +835,7 @@ async def delete_registered_client(client_id: str, current_user: EmailUserRespon
         # Delete the client
         db.delete(client)
         db.commit()
+        db.close()
 
         logger.info(f"Deleted registered OAuth client {client_id} for gateway {gateway_id} (issuer: {issuer})")
 

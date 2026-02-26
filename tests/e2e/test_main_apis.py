@@ -55,36 +55,10 @@ from httpx import AsyncClient
 import jwt
 import pytest
 import pytest_asyncio
+from pydantic import SecretStr
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-
-# First-Party
-# Completely replace RBAC decorators with no-op versions
-import mcpgateway.middleware.rbac as rbac_module
-
-# Local
-# Test utilities - must import BEFORE mcpgateway modules
-
-
-def noop_decorator(*args, **kwargs):
-    """No-op decorator that just returns the function unchanged."""
-
-    def decorator(func):
-        return func
-
-    if len(args) == 1 and callable(args[0]) and not kwargs:
-        # Direct decoration: @noop_decorator
-        return args[0]
-    else:
-        # Parameterized decoration: @noop_decorator(params)
-        return decorator
-
-
-# Replace all RBAC decorators with no-ops
-rbac_module.require_permission = noop_decorator  # pyrefly: ignore[bad-assignment]
-rbac_module.require_admin_permission = noop_decorator  # pyrefly: ignore[bad-assignment]
-rbac_module.require_any_permission = noop_decorator  # pyrefly: ignore[bad-assignment]
 
 # Standard
 # Patch bootstrap_db to prevent it from running during tests
@@ -103,8 +77,14 @@ with mock_patch("mcpgateway.bootstrap_db.main"):
 
 
 TEST_USER = "testuser"
-JWT_SECRET = "my-test-key"  # Must match mcpgateway.config.Settings.jwt_secret_key
+JWT_SECRET = "e2e-test-jwt-secret-key-with-minimum-32-bytes"  # Must match mcpgateway.config.Settings.jwt_secret_key
 JWT_ALGORITHM = "HS256"  # Must match mcpgateway.config.Settings.jwt_algorithm
+
+# Ensure test tokens use a strong signing key to avoid weak-key warnings.
+if hasattr(settings.jwt_secret_key, "get_secret_value") and callable(getattr(settings.jwt_secret_key, "get_secret_value", None)):
+    settings.jwt_secret_key = SecretStr(JWT_SECRET)
+else:
+    settings.jwt_secret_key = JWT_SECRET
 
 
 def generate_test_jwt():
@@ -113,7 +93,9 @@ def generate_test_jwt():
         "exp": int(time.time()) + 3600,
         "teams": [],  # Empty teams list allows access to public resources and own private resources
     }
-    secret = settings.jwt_secret_key.get_secret_value()
+    secret = settings.jwt_secret_key
+    if hasattr(secret, "get_secret_value") and callable(getattr(secret, "get_secret_value", None)):
+        secret = secret.get_secret_value()
     algorithm = settings.jwt_algorithm
     return jwt.encode(payload, secret, algorithm=algorithm)
 
@@ -153,6 +135,26 @@ async def temp_db():
     # Create session factory
     TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, expire_on_commit=False, bind=engine)
 
+    # Seed an admin user so PermissionService admin-bypass works for RBAC-decorated endpoints.
+    # This avoids patching RBAC decorators at import time, which leaks into other test modules.
+    # First-Party
+    from mcpgateway.db import EmailUser
+
+    seed_db = TestSessionLocal()
+    try:
+        seed_db.add(
+            EmailUser(
+                email="testuser@example.com",
+                password_hash="not-a-real-hash",
+                full_name="Test User",
+                is_admin=True,
+                is_active=True,
+            )
+        )
+        seed_db.commit()
+    finally:
+        seed_db.close()
+
     # Override the get_db dependency
     def override_get_db():
         db = TestSessionLocal()
@@ -191,7 +193,8 @@ async def temp_db():
 
     # Create custom user context with real database session
     test_user_context = create_mock_user_context(email="testuser@example.com", full_name="Test User", is_admin=True)
-    test_user_context["db"] = TestSessionLocal()  # Use real database session from this fixture
+    test_user_context_db = TestSessionLocal()
+    test_user_context["db"] = test_user_context_db  # Use real database session from this fixture
 
     # Create a simple mock function for get_current_user_with_permissions
     async def simple_mock_user_with_permissions():
@@ -230,7 +233,9 @@ async def temp_db():
 
     # Cleanup
     sec_patcher.stop()
+    test_user_context_db.close()
     app.dependency_overrides.clear()
+    engine.dispose()
     os.close(db_fd)
     os.unlink(db_path)
 
@@ -286,6 +291,14 @@ def basic_auth_header(username: str, password: str) -> dict:
     return {"Authorization": f"Basic {token}"}
 
 
+def docs_basic_auth_header() -> dict:
+    """Build Basic Auth header for docs endpoints using current runtime settings."""
+    password = settings.basic_auth_password
+    if hasattr(password, "get_secret_value") and callable(getattr(password, "get_secret_value", None)):
+        password = password.get_secret_value()
+    return basic_auth_header(settings.basic_auth_user, password)
+
+
 # -------------------------
 # Test Utility APIs
 # -------------------------
@@ -312,7 +325,7 @@ class TestDocsAndRedoc:
         settings.docs_allow_basic_auth = True
 
         """Test /docs endpoint with Basic Auth (should return 200 if credentials are valid)."""
-        headers = basic_auth_header("admin", "changeme")
+        headers = docs_basic_auth_header()
         response = await client.get("/docs", headers=headers)
         assert response.status_code == 200
 
@@ -321,7 +334,7 @@ class TestDocsAndRedoc:
         # Ensure Basic Auth for docs is allowed
         settings.docs_allow_basic_auth = True
 
-        headers = basic_auth_header("admin", "changeme")
+        headers = docs_basic_auth_header()
         response = await client.get("/redoc", headers=headers)
         assert response.status_code == 200
 
@@ -594,27 +607,27 @@ class TestServerAPIs:
         assert result["description"] == update_data["description"]
         assert result["icon"] == update_data["icon"]
 
-    async def test_toggle_server_status(self, client: AsyncClient, mock_auth):
-        """Test POST /servers/{server_id}/toggle."""
+    async def test_set_server_state(self, client: AsyncClient, mock_auth):
+        """Test POST /servers/{server_id}/state."""
         # Create a server
-        server_data = {"server": {"name": "toggle_test_server"}, "team_id": None, "visibility": "private"}
+        server_data = {"server": {"name": "state_test_server"}, "team_id": None, "visibility": "private"}
 
         create_response = await client.post("/servers", json=server_data, headers=TEST_AUTH_HEADER)
         server_id = create_response.json()["id"]
 
         # Deactivate the server
-        response = await client.post(f"/servers/{server_id}/toggle?activate=false", headers=TEST_AUTH_HEADER)
+        response = await client.post(f"/servers/{server_id}/state?activate=false", headers=TEST_AUTH_HEADER)
 
         assert response.status_code == 200
         result = response.json()
-        # The toggle endpoint returns the full server object
+        # The state endpoint returns the full server object
         assert "id" in result
         assert "name" in result
         # Check if server was deactivated
         assert result.get("enabled") is False or result.get("enabled") is False
 
         # Reactivate the server
-        response = await client.post(f"/servers/{server_id}/toggle?activate=true", headers=TEST_AUTH_HEADER)
+        response = await client.post(f"/servers/{server_id}/state?activate=true", headers=TEST_AUTH_HEADER)
 
         assert response.status_code == 200
         result = response.json()
@@ -778,11 +791,12 @@ class TestToolAPIs:
         if response.status_code == 422:
             assert "Tool name cannot be empty" in str(response.json())
 
-        # Invalid name format (special characters)
+        # Valid name format with dashes (per MCP spec - hyphens allowed in names)
         response = await client.post("/tools", json={"tool": {"name": "tool-with-dashes", "url": "https://example.com"}}, headers=TEST_AUTH_HEADER)
-        # The name might be normalized instead of rejected
+        # Tool names with hyphens are valid per MCP spec
         if response.status_code == 422:
-            assert "must start with a letter" in str(response.json())
+            # May fail for other reasons (duplicate, etc)
+            assert "must start with a letter, number, or underscore" in str(response.json()) or "already exists" in str(response.json())
         else:
             assert response.status_code == 200
 
@@ -830,16 +844,16 @@ class TestToolAPIs:
         assert result["description"] == update_data["description"]
         assert result["headers"] == update_data["headers"]
 
-    async def test_toggle_tool_status(self, client: AsyncClient, mock_auth):
-        """Test POST /tools/{tool_id}/toggle."""
+    async def test_set_tool_state(self, client: AsyncClient, mock_auth):
+        """Test POST /tools/{tool_id}/state."""
         # Create a tool
-        tool_data = {"tool": {"name": "test_toggle_tool"}, "team_id": None, "visibility": "private"}
+        tool_data = {"tool": {"name": "test_state_tool"}, "team_id": None, "visibility": "private"}
 
         create_response = await client.post("/tools", json=tool_data, headers=TEST_AUTH_HEADER)
         tool_id = create_response.json()["id"]
 
         # Deactivate the tool
-        response = await client.post(f"/tools/{tool_id}/toggle?activate=false", headers=TEST_AUTH_HEADER)
+        response = await client.post(f"/tools/{tool_id}/state?activate=false", headers=TEST_AUTH_HEADER)
 
         assert response.status_code == 200
         result = response.json()
@@ -1055,16 +1069,16 @@ class TestResourceAPIs:
         result = response.json()
         assert result["description"] == update_data["description"]
 
-    async def test_toggle_resource_status(self, client: AsyncClient, mock_auth):
-        """Test POST /resources/{resource_id}/toggle."""
+    async def test_set_resource_state(self, client: AsyncClient, mock_auth):
+        """Test POST /resources/{resource_id}/state."""
         # Create a resource
-        resource_data = {"resource": {"uri": "test/toggle", "name": "toggle_test", "content": "Test"}, "team_id": None, "visibility": "private"}
+        resource_data = {"resource": {"uri": "test/state", "name": "state_test", "content": "Test"}, "team_id": None, "visibility": "private"}
 
         create_response = await client.post("/resources", json=resource_data, headers=TEST_AUTH_HEADER)
         resource_id = create_response.json()["id"]
 
-        # Toggle resource status
-        response = await client.post(f"/resources/{resource_id}/toggle?activate=false", headers=TEST_AUTH_HEADER)
+        # Set resource state
+        response = await client.post(f"/resources/{resource_id}/state?activate=false", headers=TEST_AUTH_HEADER)
 
         assert response.status_code == 200
         assert response.json()["status"] == "success"
@@ -1271,16 +1285,16 @@ class TestPromptAPIs:
         result = response.json()
         assert "messages" in result
 
-    async def test_toggle_prompt_status(self, client: AsyncClient, mock_auth):
-        """Test POST /prompts/{prompt_id}/toggle."""
+    async def test_set_prompt_state(self, client: AsyncClient, mock_auth):
+        """Test POST /prompts/{prompt_id}/state."""
         # Create a prompt
-        prompt_data = {"prompt": {"name": "toggle_prompt", "template": "Test prompt", "arguments": []}, "team_id": None, "visibility": "private"}
+        prompt_data = {"prompt": {"name": "state_prompt", "template": "Test prompt", "arguments": []}, "team_id": None, "visibility": "private"}
 
         create_response = await client.post("/prompts", json=prompt_data, headers=TEST_AUTH_HEADER)
         prompt_id = create_response.json()["id"]
 
-        # Toggle prompt status
-        response = await client.post(f"/prompts/{prompt_id}/toggle?activate=false", headers=TEST_AUTH_HEADER)
+        # Set prompt state
+        response = await client.post(f"/prompts/{prompt_id}/state?activate=false", headers=TEST_AUTH_HEADER)
 
         assert response.status_code == 200
         assert response.json()["status"] == "success"
@@ -1424,8 +1438,8 @@ class TestGatewayAPIs:
     async def test_register_gateway(self, client: AsyncClient, mock_auth):
         """Test POST /gateways - would require mocking external connections."""
 
-    async def test_toggle_gateway_status(self, client: AsyncClient, mock_auth):
-        """Test POST /gateways/{gateway_id}/toggle."""
+    async def test_set_gateway_state(self, client: AsyncClient, mock_auth):
+        """Test POST /gateways/{gateway_id}/state."""
         # Mock a gateway for testing
         # In real tests, you'd need to register a gateway first
         # This is skipped as it requires external connectivity

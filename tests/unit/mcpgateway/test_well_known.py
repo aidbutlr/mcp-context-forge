@@ -244,12 +244,18 @@ class TestWellKnownAdminEndpoint:
     def auth_client(self):
         """Create a test client with auth dependency override."""
         # First-Party
+        from mcpgateway.config import settings
         from mcpgateway.utils.verify_credentials import require_auth
+
+        # Disable auth_required so AdminAuthMiddleware skips its check
+        original_auth_required = settings.auth_required
+        settings.auth_required = False
 
         app.dependency_overrides[require_auth] = lambda: "test_user"
         client = TestClient(app)
         yield client
         app.dependency_overrides.pop(require_auth, None)
+        settings.auth_required = original_auth_required
 
     @patch("mcpgateway.routers.well_known.settings")
     def test_admin_well_known_status_basic(self, mock_settings, auth_client):
@@ -354,3 +360,25 @@ class TestWellKnownRegistry:
 
         for file in text_files:
             assert WELL_KNOWN_REGISTRY[file]["content_type"] == "text/plain"
+
+
+# NOTE: RFC 9728 compliant OAuth Protected Resource tests are in test_well_known_rfc9728.py
+# The deprecated query-parameter endpoint now returns 404 (tested in routers/test_well_known.py)
+
+
+class TestServerRouterOAuthProtectedResource:
+    """Test deprecated server-scoped OAuth Protected Resource endpoint."""
+
+    @pytest.fixture
+    def client(self):
+        """Create a test client for the FastAPI app."""
+        return TestClient(app)
+
+    def test_server_oauth_protected_resource_deprecated_redirects(self, client):
+        """Test that deprecated server-scoped endpoint returns 301 redirect to RFC 9728 path."""
+        # The deprecated endpoint now returns 301 redirect regardless of server state
+        response = client.get("/servers/test-server-id/.well-known/oauth-protected-resource", follow_redirects=False)
+        assert response.status_code == 301
+        assert "Location" in response.headers
+        redirect_url = response.headers["Location"]
+        assert "/.well-known/oauth-protected-resource/servers/test-server-id/mcp" in redirect_url

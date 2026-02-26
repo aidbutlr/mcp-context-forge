@@ -19,24 +19,112 @@ Examples:
 
 # Standard
 import asyncio
-from datetime import timedelta
-from typing import Any, Dict, List, Optional, Tuple
+import base64
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # Third-Party
-from sqlalchemy import func, select
+import orjson
+from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.orm import selectinload, Session
 
 # First-Party
 from mcpgateway.cache.admin_stats_cache import admin_stats_cache
-from mcpgateway.cache.auth_cache import auth_cache
+from mcpgateway.cache.auth_cache import auth_cache, get_auth_cache
 from mcpgateway.config import settings
 from mcpgateway.db import EmailTeam, EmailTeamJoinRequest, EmailTeamMember, EmailTeamMemberHistory, EmailUser, utc_now
 from mcpgateway.services.logging_service import LoggingService
-from mcpgateway.utils.pagination import offset_paginate
+from mcpgateway.utils.create_slug import slugify
+from mcpgateway.utils.pagination import unified_paginate
+from mcpgateway.utils.redis_client import get_redis_client
 
 # Initialize logging
 logging_service = LoggingService()
 logger = logging_service.get_logger(__name__)
+
+
+class TeamManagementError(Exception):
+    """Base class for team management-related errors.
+
+    Examples:
+        >>> error = TeamManagementError("Test error")
+        >>> str(error)
+        'Test error'
+        >>> isinstance(error, Exception)
+        True
+    """
+
+
+class InvalidRoleError(TeamManagementError):
+    """Raised when an invalid role is specified.
+
+    Examples:
+        >>> error = InvalidRoleError("Invalid role: guest")
+        >>> str(error)
+        'Invalid role: guest'
+        >>> isinstance(error, TeamManagementError)
+        True
+    """
+
+
+class TeamNotFoundError(TeamManagementError):
+    """Raised when a team does not exist.
+
+    Examples:
+        >>> error = TeamNotFoundError("Team not found: team-123")
+        >>> str(error)
+        'Team not found: team-123'
+        >>> isinstance(error, TeamManagementError)
+        True
+    """
+
+
+class UserNotFoundError(TeamManagementError):
+    """Raised when a user does not exist.
+
+    Examples:
+        >>> error = UserNotFoundError("User not found: user@example.com")
+        >>> str(error)
+        'User not found: user@example.com'
+        >>> isinstance(error, TeamManagementError)
+        True
+    """
+
+
+class MemberAlreadyExistsError(TeamManagementError):
+    """Raised when a user is already a member of the team.
+
+    Examples:
+        >>> error = MemberAlreadyExistsError("User user@example.com is already a member of team team-123")
+        >>> str(error)
+        'User user@example.com is already a member of team team-123'
+        >>> isinstance(error, TeamManagementError)
+        True
+    """
+
+
+class TeamMemberLimitExceededError(TeamManagementError):
+    """Raised when a team has reached its maximum member limit.
+
+    Examples:
+        >>> error = TeamMemberLimitExceededError("Team has reached maximum member limit of 10")
+        >>> str(error)
+        'Team has reached maximum member limit of 10'
+        >>> isinstance(error, TeamManagementError)
+        True
+    """
+
+
+class TeamMemberAddError(TeamManagementError):
+    """Raised when adding a member to a team fails due to database or system errors.
+
+    Examples:
+        >>> error = TeamMemberAddError("Failed to add member due to database error")
+        >>> str(error)
+        'Failed to add member due to database error'
+        >>> isinstance(error, TeamManagementError)
+        True
+    """
 
 
 class TeamManagementService:
@@ -79,6 +167,59 @@ class TeamManagementService:
             'TeamManagementService'
         """
         self.db = db
+        self._role_service = None  # Lazy initialization to avoid circular imports
+
+    @property
+    def role_service(self):
+        """Lazy-initialized RoleService to avoid circular imports.
+
+        Returns:
+            RoleService: Instance of RoleService
+        """
+        if self._role_service is None:
+            # First-Party
+            from mcpgateway.services.role_service import RoleService  # pylint: disable=import-outside-toplevel
+
+            self._role_service = RoleService(self.db)
+        return self._role_service
+
+    @staticmethod
+    def _get_rbac_role_name(membership_role: str) -> str:
+        """Map a team membership role to the corresponding configurable RBAC role name.
+
+        Args:
+            membership_role: Team membership role ('owner' or 'member').
+
+        Returns:
+            str: The configured RBAC role name from settings.
+        """
+        return settings.default_team_owner_role if membership_role == "owner" else settings.default_team_member_role
+
+    @staticmethod
+    def _fire_and_forget(coro: Any) -> None:
+        """Schedule a background coroutine and close it if scheduling fails.
+
+        Args:
+            coro: The coroutine to schedule as a background task.
+
+        Raises:
+            Exception: If asyncio.create_task fails (e.g. no running loop).
+        """
+        try:
+            task = asyncio.create_task(coro)
+            # Some tests patch create_task with a plain Mock return value. In that
+            # case the coroutine is never actually scheduled and must be closed.
+            if asyncio.iscoroutine(coro) and not isinstance(task, asyncio.Task):
+                close = getattr(coro, "close", None)
+                if callable(close):
+                    close()
+        except Exception:
+            # If create_task() fails (e.g. no running loop), the coroutine has
+            # already been created and must be closed to avoid runtime warnings.
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            raise
 
     def _log_team_member_action(self, team_member_id: str, team_id: str, user_email: str, role: str, action: str, action_by: Optional[str]):
         """
@@ -177,8 +318,6 @@ class TeamManagementService:
                 max_members = getattr(settings, "max_members_per_team", 100)
 
             # Check for existing inactive team with same name
-            # First-Party
-            from mcpgateway.utils.create_slug import slugify  # pylint: disable=import-outside-toplevel
 
             potential_slug = slugify(name)
             existing_inactive_team = self.db.query(EmailTeam).filter(EmailTeam.slug == potential_slug, EmailTeam.is_active.is_(False)).first()
@@ -355,6 +494,8 @@ class TeamManagementService:
             logger.info(f"Updated team {team_id} by {updated_by}")
             return True
 
+        except ValueError:
+            raise  # Let ValueError propagate to caller for proper error handling
         except Exception as e:
             self.db.rollback()
             logger.error(f"Failed to update team {team_id}: {e}")
@@ -409,13 +550,13 @@ class TeamManagementService:
 
             # Invalidate all role caches for this team
             try:
-                asyncio.create_task(auth_cache.invalidate_team_roles(team_id))
-                asyncio.create_task(admin_stats_cache.invalidate_teams())
+                self._fire_and_forget(auth_cache.invalidate_team_roles(team_id))
+                self._fire_and_forget(admin_stats_cache.invalidate_teams())
                 # Also invalidate team cache, teams list cache, and team membership cache for each member
                 for membership in memberships:
-                    asyncio.create_task(auth_cache.invalidate_team(membership.user_email))
-                    asyncio.create_task(auth_cache.invalidate_user_teams(membership.user_email))
-                    asyncio.create_task(auth_cache.invalidate_team_membership(membership.user_email))
+                    self._fire_and_forget(auth_cache.invalidate_team(membership.user_email))
+                    self._fire_and_forget(auth_cache.invalidate_user_teams(membership.user_email))
+                    self._fire_and_forget(auth_cache.invalidate_team_membership(membership.user_email))
             except Exception as cache_error:
                 logger.debug(f"Failed to invalidate caches on team delete: {cache_error}")
 
@@ -427,7 +568,7 @@ class TeamManagementService:
             logger.error(f"Failed to delete team {team_id}: {e}")
             return False
 
-    async def add_member_to_team(self, team_id: str, user_email: str, role: str = "member", invited_by: Optional[str] = None) -> bool:
+    async def add_member_to_team(self, team_id: str, user_email: str, role: str = "member", invited_by: Optional[str] = None) -> EmailTeamMember:
         """Add a member to a team.
 
         Args:
@@ -437,10 +578,16 @@ class TeamManagementService:
             invited_by: Email of user who added this member
 
         Returns:
-            bool: True if member was added successfully, False otherwise
+            EmailTeamMember: The created or reactivated team member object
 
         Raises:
-            ValueError: If role is invalid or team member limit exceeded
+            InvalidRoleError: If role is invalid
+            TeamNotFoundError: If team does not exist
+            TeamManagementError: If team is a personal team
+            UserNotFoundError: If user does not exist
+            MemberAlreadyExistsError: If user is already a member
+            TeamMemberLimitExceededError: If team has reached maximum member limit
+            TeamMemberAddError: If adding member fails due to database or system errors
 
         Examples:
             >>> import asyncio
@@ -451,40 +598,45 @@ class TeamManagementService:
             >>> # After adding, EmailTeamMemberHistory is updated
             >>> # service._log_team_member_action("tm-123", "team-123", "user@example.com", "member", "added", "admin@example.com")
         """
+        # Validate role
+        valid_roles = ["owner", "member"]
+        if role not in valid_roles:
+            raise InvalidRoleError(f"Invalid role '{role}'. Must be one of: {', '.join(valid_roles)}")
+
+        # Check if team exists
+        team = await self.get_team_by_id(team_id)
+        if not team:
+            logger.warning(f"Team {team_id} not found")
+            raise TeamNotFoundError("Team not found")
+
+        # Prevent adding members to personal teams
+        if team.is_personal:
+            logger.warning(f"Cannot add members to personal team {team_id}")
+            raise TeamManagementError("Cannot add members to personal teams")
+
+        # Check if user exists
+        user = self.db.query(EmailUser).filter(EmailUser.email == user_email).first()
+        if not user:
+            logger.warning(f"User {user_email} not found")
+            raise UserNotFoundError("User not found")
+
+        # Check if user is already a member
+        existing_membership = self.db.query(EmailTeamMember).filter(EmailTeamMember.team_id == team_id, EmailTeamMember.user_email == user_email).first()
+
+        if existing_membership and existing_membership.is_active:
+            logger.warning(f"User {user_email} is already a member of team {team_id}")
+            raise MemberAlreadyExistsError("User is already a member of this team")
+
+        # Check team member limit
+        if team.max_members:
+            current_member_count = self.db.query(EmailTeamMember).filter(EmailTeamMember.team_id == team_id, EmailTeamMember.is_active.is_(True)).count()
+
+            if current_member_count >= team.max_members:
+                logger.warning(f"Team {team_id} has reached maximum member limit of {team.max_members}")
+                raise TeamMemberLimitExceededError(f"Team has reached maximum member limit of {team.max_members}")
+
+        # Add or reactivate membership
         try:
-            # Validate role
-            valid_roles = ["owner", "member"]
-            if role not in valid_roles:
-                raise ValueError(f"Invalid role. Must be one of: {', '.join(valid_roles)}")
-
-            # Check if team exists
-            team = await self.get_team_by_id(team_id)
-            if not team:
-                logger.warning(f"Team {team_id} not found")
-                return False
-
-            # Check if user exists
-            user = self.db.query(EmailUser).filter(EmailUser.email == user_email).first()
-            if not user:
-                logger.warning(f"User {user_email} not found")
-                return False
-
-            # Check if user is already a member
-            existing_membership = self.db.query(EmailTeamMember).filter(EmailTeamMember.team_id == team_id, EmailTeamMember.user_email == user_email).first()
-
-            if existing_membership and existing_membership.is_active:
-                logger.warning(f"User {user_email} is already a member of team {team_id}")
-                return False
-
-            # Check team member limit
-            if team.max_members:
-                current_member_count = self.db.query(EmailTeamMember).filter(EmailTeamMember.team_id == team_id, EmailTeamMember.is_active.is_(True)).count()
-
-                if current_member_count >= team.max_members:
-                    logger.warning(f"Team {team_id} has reached maximum member limit")
-                    raise ValueError(f"Team has reached maximum member limit of {team.max_members}")
-
-            # Add or reactivate membership
             if existing_membership:
                 existing_membership.is_active = True
                 existing_membership.role = role
@@ -492,19 +644,37 @@ class TeamManagementService:
                 existing_membership.invited_by = invited_by
                 self.db.commit()
                 self._log_team_member_action(existing_membership.id, team_id, user_email, role, "reactivated", invited_by)
+                member = existing_membership
             else:
                 membership = EmailTeamMember(team_id=team_id, user_email=user_email, role=role, joined_at=utc_now(), invited_by=invited_by, is_active=True)
                 self.db.add(membership)
                 self.db.commit()
                 self._log_team_member_action(membership.id, team_id, user_email, role, "added", invited_by)
+                member = membership
+
+            # Assign team-scoped RBAC role matching the membership role (owner or member)
+            try:
+                rbac_role_name = self._get_rbac_role_name(role)
+                team_rbac_role = await self.role_service.get_role_by_name(rbac_role_name, scope="team")
+                if team_rbac_role:
+                    existing = await self.role_service.get_user_role_assignment(user_email=user_email, role_id=team_rbac_role.id, scope="team", scope_id=team_id)
+                    if not existing or not existing.is_active:
+                        await self.role_service.assign_role_to_user(user_email=user_email, role_id=team_rbac_role.id, scope="team", scope_id=team_id, granted_by=invited_by or user_email)
+                        logger.info(f"Assigned {rbac_role_name} role to {user_email} for team {team_id}")
+                    else:
+                        logger.debug(f"User {user_email} already has active {rbac_role_name} role for team {team_id}")
+                else:
+                    logger.warning(f"Role '{rbac_role_name}' not found. User {user_email} added without RBAC role.")
+            except Exception as role_error:
+                logger.warning(f"Failed to assign role to {user_email}: {role_error}")
 
             # Invalidate auth cache for user's team membership and role
             try:
-                asyncio.create_task(auth_cache.invalidate_team(user_email))
-                asyncio.create_task(auth_cache.invalidate_user_role(user_email, team_id))
-                asyncio.create_task(auth_cache.invalidate_user_teams(user_email))
-                asyncio.create_task(auth_cache.invalidate_team_membership(user_email))
-                asyncio.create_task(admin_stats_cache.invalidate_teams())
+                self._fire_and_forget(auth_cache.invalidate_team(user_email))
+                self._fire_and_forget(auth_cache.invalidate_user_role(user_email, team_id))
+                self._fire_and_forget(auth_cache.invalidate_user_teams(user_email))
+                self._fire_and_forget(auth_cache.invalidate_team_membership(user_email))
+                self._fire_and_forget(admin_stats_cache.invalidate_teams())
             except Exception as cache_error:
                 logger.debug(f"Failed to invalidate cache on team add: {cache_error}")
 
@@ -512,12 +682,12 @@ class TeamManagementService:
             await self.invalidate_team_member_count_cache(str(team_id))
 
             logger.info(f"Added {user_email} to team {team_id} with role {role}")
-            return True
+            return member
 
         except Exception as e:
             self.db.rollback()
             logger.error(f"Failed to add {user_email} to team {team_id}: {e}")
-            return False
+            raise TeamMemberAddError("Failed to add member to team") from e
 
     async def remove_member_from_team(self, team_id: str, user_email: str, removed_by: Optional[str] = None) -> bool:
         """Remove a member from a team.
@@ -568,12 +738,24 @@ class TeamManagementService:
             self.db.commit()
             self._log_team_member_action(membership.id, team_id, user_email, membership.role, "removed", removed_by)
 
+            # Revoke all team-scoped RBAC roles from removed member defensively
+            # (revoke both owner and member roles to handle edge cases)
+            try:
+                for role_name in (settings.default_team_owner_role, settings.default_team_member_role):
+                    rbac_role = await self.role_service.get_role_by_name(role_name, scope="team")
+                    if rbac_role:
+                        revoked = await self.role_service.revoke_role_from_user(user_email=user_email, role_id=rbac_role.id, scope="team", scope_id=team_id)
+                        if revoked:
+                            logger.info(f"Revoked {role_name} role from {user_email} for team {team_id}")
+            except Exception as role_error:
+                logger.warning(f"Failed to revoke roles from {user_email}: {role_error}")
+
             # Invalidate auth cache for user's team membership and role
             try:
-                asyncio.create_task(auth_cache.invalidate_team(user_email))
-                asyncio.create_task(auth_cache.invalidate_user_role(user_email, team_id))
-                asyncio.create_task(auth_cache.invalidate_user_teams(user_email))
-                asyncio.create_task(auth_cache.invalidate_team_membership(user_email))
+                self._fire_and_forget(auth_cache.invalidate_team(user_email))
+                self._fire_and_forget(auth_cache.invalidate_user_role(user_email, team_id))
+                self._fire_and_forget(auth_cache.invalidate_user_teams(user_email))
+                self._fire_and_forget(auth_cache.invalidate_team_membership(user_email))
             except Exception as cache_error:
                 logger.debug(f"Failed to invalidate cache on team remove: {cache_error}")
 
@@ -639,23 +821,70 @@ class TeamManagementService:
                     raise ValueError("Cannot remove owner role from the last owner of a team")
 
             # Update the role
+            old_role = membership.role
             membership.role = new_role
             self.db.commit()
             self._log_team_member_action(membership.id, team_id, user_email, new_role, "role_changed", updated_by)
 
+            # Handle RBAC role changes when team membership role changes
+            if old_role != new_role:
+                try:
+                    # Get both role types
+                    team_member_role = await self.role_service.get_role_by_name(settings.default_team_member_role, scope="team")
+                    team_owner_role = await self.role_service.get_role_by_name(settings.default_team_owner_role, scope="team")
+
+                    # Handle role transitions
+                    if old_role == "member" and new_role == "owner":
+                        # member -> owner: revoke member role, assign owner role
+                        if team_member_role:
+                            await self.role_service.revoke_role_from_user(user_email=user_email, role_id=team_member_role.id, scope="team", scope_id=team_id)
+                        if team_owner_role:
+                            await self.role_service.assign_role_to_user(user_email=user_email, role_id=team_owner_role.id, scope="team", scope_id=team_id, granted_by=updated_by or user_email)
+                        logger.info(f"Transitioned RBAC role from {settings.default_team_member_role} to {settings.default_team_owner_role} for {user_email} in team {team_id}")
+
+                    elif old_role == "owner" and new_role == "member":
+                        # owner -> member: revoke owner role, assign member role
+                        if team_owner_role:
+                            await self.role_service.revoke_role_from_user(user_email=user_email, role_id=team_owner_role.id, scope="team", scope_id=team_id)
+                        if team_member_role:
+                            await self.role_service.assign_role_to_user(user_email=user_email, role_id=team_member_role.id, scope="team", scope_id=team_id, granted_by=updated_by or user_email)
+                        logger.info(f"Transitioned RBAC role from {settings.default_team_owner_role} to {settings.default_team_member_role} for {user_email} in team {team_id}")
+
+                except Exception as role_error:
+                    logger.warning(f"Failed to update RBAC roles for {user_email} in team {team_id}: {role_error}")
+                    # Don't fail the membership role update if RBAC role update fails
+
             # Invalidate role cache
             try:
-                asyncio.create_task(auth_cache.invalidate_user_role(user_email, team_id))
+                self._fire_and_forget(auth_cache.invalidate_user_role(user_email, team_id))
             except Exception as cache_error:
                 logger.debug(f"Failed to invalidate cache on role update: {cache_error}")
 
             logger.info(f"Updated role of {user_email} in team {team_id} to {new_role} by {updated_by}")
             return True
 
+        except ValueError:
+            raise  # Let ValueError propagate to caller for proper error handling
         except Exception as e:
             self.db.rollback()
             logger.error(f"Failed to update role of {user_email} in team {team_id}: {e}")
             return False
+
+    async def get_member(self, team_id: str, user_email: str) -> Optional[EmailTeamMember]:
+        """Get a single team member by team ID and user email.
+
+        Args:
+            team_id: ID of the team
+            user_email: Email of the user
+
+        Returns:
+            EmailTeamMember if found and active, None otherwise
+        """
+        try:
+            return self.db.query(EmailTeamMember).filter(EmailTeamMember.team_id == team_id, EmailTeamMember.user_email == user_email, EmailTeamMember.is_active.is_(True)).first()
+        except Exception as e:
+            logger.error(f"Failed to get member {user_email} in team {team_id}: {e}")
+            return None
 
     async def get_user_teams(self, user_email: str, include_personal: bool = True) -> List[EmailTeam]:
         """Get all teams a user belongs to.
@@ -768,78 +997,142 @@ class TeamManagementService:
 
         return team_id
 
-    async def get_team_members(self, team_id: str) -> List[Tuple[EmailUser, EmailTeamMember]]:
-        """Get all members of a team.
+    async def get_team_members(
+        self,
+        team_id: str,
+        cursor: Optional[str] = None,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        per_page: Optional[int] = None,
+    ) -> Union[List[Tuple[EmailUser, EmailTeamMember]], Tuple[List[Tuple[EmailUser, EmailTeamMember]], Optional[str]], Dict[str, Any]]:
+        """Get all members of a team with optional cursor or page-based pagination.
 
         Note: This method returns ORM objects and cannot be cached since callers
         depend on ORM attributes and methods.
 
         Args:
             team_id: ID of the team
+            cursor: Opaque cursor token for cursor-based pagination
+            limit: Maximum number of members to return (for cursor-based, default: 50)
+            page: Page number for page-based pagination (1-indexed). Mutually exclusive with cursor.
+            per_page: Items per page for page-based pagination (default: 30)
 
         Returns:
-            List[Tuple[EmailUser, EmailTeamMember]]: List of (user, membership) tuples
+            - If cursor is provided: Tuple (members, next_cursor)
+            - If page is provided: Dict with keys 'data', 'pagination', 'links'
+            - If neither: List of all members (backward compatibility)
 
         Examples:
             Team member management and role display.
         """
         try:
-            members = (
-                self.db.query(EmailUser, EmailTeamMember)
-                .join(EmailTeamMember, EmailUser.email == EmailTeamMember.user_email)
-                .filter(EmailTeamMember.team_id == team_id, EmailTeamMember.is_active.is_(True))
-                .all()
+            # Build base query - for pagination, select EmailTeamMember and eager-load user
+            # For backward compat (no pagination), select both entities as tuple
+            if cursor is None and page is None and limit is None:
+                # Backward compatibility: return tuples (no pagination requested)
+                query = (
+                    select(EmailUser, EmailTeamMember)
+                    .join(EmailTeamMember, EmailUser.email == EmailTeamMember.user_email)
+                    .where(EmailTeamMember.team_id == team_id, EmailTeamMember.is_active.is_(True))
+                    .order_by(EmailUser.full_name, EmailUser.email)
+                )
+                result = self.db.execute(query)
+                members = list(result.all())
+                self.db.commit()
+                return members
+
+            # For pagination: select EmailTeamMember and eager-load user to avoid N+1
+            query = (
+                select(EmailTeamMember)
+                .options(selectinload(EmailTeamMember.user))
+                .where(EmailTeamMember.team_id == team_id, EmailTeamMember.is_active.is_(True))
+                .join(EmailUser, EmailUser.email == EmailTeamMember.user_email)
             )
-            self.db.commit()  # Release transaction to avoid idle-in-transaction
-            return members
+
+            # PAGE-BASED PAGINATION (Admin UI) - use unified_paginate
+            if page is not None:
+                # Alphabetical ordering for user-friendly display
+                query = query.order_by(EmailUser.full_name, EmailUser.email)
+                pag_result = await unified_paginate(
+                    db=self.db,
+                    query=query,
+                    page=page,
+                    per_page=per_page or 30,
+                    cursor=None,
+                    limit=None,
+                    base_url=f"/admin/teams/{team_id}/members",
+                    query_params={},
+                )
+                self.db.commit()
+                memberships = pag_result["data"]
+                tuples = [(m.user, m) for m in memberships]
+                return {
+                    "data": tuples,
+                    "pagination": pag_result["pagination"],
+                    "links": pag_result["links"],
+                }
+
+            # CURSOR-BASED PAGINATION (API) - custom implementation using (joined_at, id)
+            # unified_paginate uses created_at which doesn't exist on EmailTeamMember
+
+            # Order by joined_at DESC, id DESC for keyset pagination
+            query = query.order_by(desc(EmailTeamMember.joined_at), desc(EmailTeamMember.id))
+
+            # Decode cursor and apply keyset filter
+            if cursor:
+                try:
+                    cursor_json = base64.urlsafe_b64decode(cursor.encode()).decode()
+                    cursor_data = orjson.loads(cursor_json)
+                    last_id = cursor_data.get("id")
+                    joined_str = cursor_data.get("joined_at")
+                    if last_id and joined_str:
+                        last_joined = datetime.fromisoformat(joined_str)
+                        # Keyset filter: (joined_at < last) OR (joined_at = last AND id < last_id)
+                        query = query.where(
+                            or_(
+                                EmailTeamMember.joined_at < last_joined,
+                                and_(EmailTeamMember.joined_at == last_joined, EmailTeamMember.id < last_id),
+                            )
+                        )
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Invalid cursor for team members, ignoring: {e}")
+
+            # Fetch limit + 1 to check for more results (cap at max_page_size)
+            page_size = min(limit or 50, settings.pagination_max_page_size)
+            query = query.limit(page_size + 1)
+            memberships = list(self.db.execute(query).scalars().all())
+
+            # Check if there are more results
+            has_more = len(memberships) > page_size
+            if has_more:
+                memberships = memberships[:page_size]
+
+            # Generate next cursor using (joined_at, id)
+            next_cursor = None
+            if has_more and memberships:
+                last_member = memberships[-1]
+                cursor_data = {
+                    "joined_at": last_member.joined_at.isoformat() if last_member.joined_at else None,
+                    "id": last_member.id,
+                }
+                next_cursor = base64.urlsafe_b64encode(orjson.dumps(cursor_data)).decode()
+
+            self.db.commit()
+            tuples = [(m.user, m) for m in memberships]
+            return (tuples, next_cursor)
 
         except Exception as e:
             self.db.rollback()
             logger.error(f"Failed to get members for team {team_id}: {e}")
+
+            # Return appropriate empty response based on mode
+            if page is not None:
+                return {"data": [], "pagination": {"page": page, "per_page": per_page or 30, "total": 0, "has_next": False, "has_prev": False}, "links": None}
+
+            if cursor is not None:
+                return ([], None)
+
             return []
-
-    async def list_team_members_paginated(
-        self,
-        team_id: str,
-        page: int = 1,
-        per_page: Optional[int] = None,
-        base_url: str = "",
-        query_params: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Get team members with offset-based pagination.
-
-        Args:
-            team_id: ID of the team.
-            page: Page number (1-indexed).
-            per_page: Items per page (uses default if None).
-            base_url: Base URL for pagination links.
-            query_params: Additional query parameters to include in links.
-
-        Returns:
-            Dict[str, Any]: Pagination result with data, pagination, and links.
-        """
-        try:
-            query = (
-                select(EmailTeamMember).options(selectinload(EmailTeamMember.user)).where(EmailTeamMember.team_id == team_id, EmailTeamMember.is_active.is_(True)).order_by(EmailTeamMember.user_email)
-            )
-            result = await offset_paginate(
-                db=self.db,
-                query=query,
-                page=page,
-                per_page=per_page or settings.pagination_default_page_size,
-                base_url=base_url,
-                query_params=query_params,
-            )
-            self.db.commit()  # Release transaction to avoid idle-in-transaction
-            return result
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Failed to paginate members for team {team_id}: {e}")
-            return {
-                "data": [],
-                "pagination": None,
-                "links": None,
-            }
 
     def count_team_owners(self, team_id: str) -> int:
         """Count the number of owners in a team using SQL COUNT.
@@ -863,9 +1156,6 @@ class TeamManagementService:
             AuthCache instance or None if unavailable.
         """
         try:
-            # First-Party
-            from mcpgateway.cache.auth_cache import get_auth_cache  # pylint: disable=import-outside-toplevel
-
             return get_auth_cache()
         except ImportError:
             return None
@@ -924,48 +1214,181 @@ class TeamManagementService:
             logger.error(f"Failed to get role for {user_email} in team {team_id}: {e}")
             return None
 
-    async def list_teams(self, limit: int = 100, offset: int = 0, visibility_filter: Optional[str] = None) -> Tuple[List[EmailTeam], int]:
-        """List teams with pagination.
-
-        Note: This method returns ORM objects and cannot be cached since callers
-        depend on ORM methods (e.g., team.get_member_count()) and attributes
-        (created_at, updated_at) that cannot be serialized.
+    async def list_teams(
+        self,
+        # Unified pagination params
+        limit: int = 100,
+        offset: int = 0,
+        cursor: Optional[str] = None,
+        page: Optional[int] = None,
+        per_page: int = 50,
+        include_inactive: bool = False,
+        visibility_filter: Optional[str] = None,
+        base_url: Optional[str] = None,
+        include_personal: bool = False,
+        search_query: Optional[str] = None,
+    ) -> Union[Tuple[List[EmailTeam], Optional[str]], Dict[str, Any]]:
+        """List teams with pagination support (cursor or page based).
 
         Args:
-            limit: Maximum number of teams to return
-            offset: Number of teams to skip
+            limit: Max items for cursor pagination
+            offset: Offset for legacy/cursor pagination
+            cursor: Cursor token
+            page: Page number (1-indexed)
+            per_page: Items per page
+            include_inactive: Whether to include inactive teams
             visibility_filter: Filter by visibility (private, team, public)
+            base_url: Base URL for pagination links
+            include_personal: Whether to include personal teams
+            search_query: Search term for name/slug/description
 
         Returns:
-            Tuple[List[EmailTeam], int]: (teams, total_count)
-
-        Examples:
-            Team discovery and administration.
+            Union[Tuple[List[EmailTeam], Optional[str]], Dict[str, Any]]:
+                - Tuple (teams, next_cursor) if cursor/offset based
+                - Dict {data, pagination, links} if page based
         """
-        try:
-            query = self.db.query(EmailTeam).filter(EmailTeam.is_active.is_(True), EmailTeam.is_personal.is_(False))  # Exclude personal teams from listings
+        query = select(EmailTeam)
 
-            if visibility_filter:
-                query = query.filter(EmailTeam.visibility == visibility_filter)
+        if not include_personal:
+            query = query.where(EmailTeam.is_personal.is_(False))
 
-            total_count = query.count()
-            teams = query.offset(offset).limit(limit).all()
-            self.db.commit()  # Release transaction to avoid idle-in-transaction
+        if not include_inactive:
+            query = query.where(EmailTeam.is_active.is_(True))
 
-            return teams, total_count
+        if visibility_filter:
+            query = query.where(EmailTeam.visibility == visibility_filter)
 
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Failed to list teams: {e}")
-            return [], 0
+        if search_query:
+            search_term = f"%{search_query}%"
+            query = query.where(
+                or_(
+                    EmailTeam.name.ilike(search_term),
+                    EmailTeam.slug.ilike(search_term),
+                    EmailTeam.description.ilike(search_term),
+                )
+            )
 
-    async def discover_public_teams(self, user_email: str, skip: int = 0, limit: int = 50) -> List[EmailTeam]:
+        # Choose ordering based on pagination mode:
+        # - Page-based (UI): alphabetical by name for user-friendly display
+        # - Cursor-based (API): created_at DESC, id DESC to match unified_paginate expectations
+        if page is not None:
+            query = query.order_by(EmailTeam.name, EmailTeam.id)
+        else:
+            query = query.order_by(desc(EmailTeam.created_at), desc(EmailTeam.id))
+
+        # Base URL for pagination links (default to admin partial if not provided)
+        if not base_url:
+            base_url = f"{settings.app_root_path}/admin/teams/partial"
+
+        # Apply offset manually for legacy offset-based pagination if not using page or cursor
+        if not page and not cursor and offset > 0:
+            query = query.offset(offset)
+
+        result = await unified_paginate(
+            db=self.db,
+            query=query,
+            cursor=cursor,
+            limit=limit,
+            page=page,
+            per_page=per_page,
+            base_url=base_url,
+        )
+        self.db.commit()  # Release transaction to avoid idle-in-transaction
+        return result
+
+    async def get_all_team_ids(
+        self,
+        include_inactive: bool = False,
+        visibility_filter: Optional[str] = None,
+        include_personal: bool = False,
+        search_query: Optional[str] = None,
+    ) -> List[int]:
+        """Get all team IDs matching criteria (unpaginated).
+
+        Args:
+            include_inactive: Whether to include inactive teams
+            visibility_filter: Filter by visibility (private, team, public)
+            include_personal: Whether to include personal teams
+            search_query: Search term for name/slug
+
+        Returns:
+            List[int]: List of team IDs
+        """
+        query = select(EmailTeam.id)
+
+        if not include_personal:
+            query = query.where(EmailTeam.is_personal.is_(False))
+
+        if not include_inactive:
+            query = query.where(EmailTeam.is_active.is_(True))
+
+        if visibility_filter:
+            query = query.where(EmailTeam.visibility == visibility_filter)
+
+        if search_query:
+            search_term = f"%{search_query}%"
+            query = query.where(
+                or_(
+                    EmailTeam.name.ilike(search_term),
+                    EmailTeam.slug.ilike(search_term),
+                )
+            )
+
+        result = self.db.execute(query)
+        team_ids = [row[0] for row in result.all()]
+        self.db.commit()  # Release transaction to avoid idle-in-transaction
+        return team_ids
+
+    async def get_teams_count(
+        self,
+        include_inactive: bool = False,
+        visibility_filter: Optional[str] = None,
+        include_personal: bool = False,
+        search_query: Optional[str] = None,
+    ) -> int:
+        """Get total count of teams matching criteria.
+
+        Args:
+            include_inactive: Whether to include inactive teams
+            visibility_filter: Filter by visibility (private, team, public)
+            include_personal: Whether to include personal teams
+            search_query: Search term for name/slug
+
+        Returns:
+            int: Total count of matching teams
+        """
+        query = select(func.count(EmailTeam.id))  # pylint: disable=not-callable
+
+        if not include_personal:
+            query = query.where(EmailTeam.is_personal.is_(False))
+
+        if not include_inactive:
+            query = query.where(EmailTeam.is_active.is_(True))
+
+        if visibility_filter:
+            query = query.where(EmailTeam.visibility == visibility_filter)
+
+        if search_query:
+            search_term = f"%{search_query}%"
+            query = query.where(
+                or_(
+                    EmailTeam.name.ilike(search_term),
+                    EmailTeam.slug.ilike(search_term),
+                )
+            )
+
+        result = self.db.execute(query)
+        count = result.scalar() or 0
+        self.db.commit()  # Release transaction to avoid idle-in-transaction
+        return count
+
+    async def discover_public_teams(self, user_email: str, skip: int = 0, limit: Optional[int] = None) -> List[EmailTeam]:
         """Discover public teams that user can join.
 
         Args:
             user_email: Email of the user discovering teams
             skip: Number of teams to skip for pagination
-            limit: Maximum number of teams to return
+            limit: Maximum number of teams to return (None for unlimited)
 
         Returns:
             List[EmailTeam]: List of public teams user can join
@@ -979,7 +1402,10 @@ class TeamManagementService:
 
             query = self.db.query(EmailTeam).filter(EmailTeam.visibility == "public", EmailTeam.is_active.is_(True), EmailTeam.is_personal.is_(False), ~EmailTeam.id.in_(user_team_subquery))
 
-            teams = query.offset(skip).limit(limit).all()
+            query = query.offset(skip)
+            if limit is not None:
+                query = query.limit(limit)
+            teams = query.all()
             self.db.commit()  # Release transaction to avoid idle-in-transaction
             return teams
 
@@ -1107,13 +1533,29 @@ class TeamManagementService:
 
             self.db.refresh(member)
 
+            # Assign team-scoped RBAC role matching the membership role
+            try:
+                rbac_role_name = self._get_rbac_role_name(member.role)
+                team_rbac_role = await self.role_service.get_role_by_name(rbac_role_name, scope="team")
+                if team_rbac_role:
+                    existing = await self.role_service.get_user_role_assignment(user_email=join_request.user_email, role_id=team_rbac_role.id, scope="team", scope_id=join_request.team_id)
+                    if not existing or not existing.is_active:
+                        await self.role_service.assign_role_to_user(user_email=join_request.user_email, role_id=team_rbac_role.id, scope="team", scope_id=join_request.team_id, granted_by=approved_by)
+                        logger.info(f"Assigned {rbac_role_name} role to {join_request.user_email} for team {join_request.team_id}")
+                    else:
+                        logger.debug(f"User {join_request.user_email} already has active {rbac_role_name} role for team {join_request.team_id}")
+                else:
+                    logger.warning(f"Role '{rbac_role_name}' not found. User {join_request.user_email} added without RBAC role.")
+            except Exception as role_error:
+                logger.warning(f"Failed to assign role to {join_request.user_email}: {role_error}")
+
             # Invalidate auth cache for user's team membership and role
             try:
-                asyncio.create_task(auth_cache.invalidate_team(join_request.user_email))
-                asyncio.create_task(auth_cache.invalidate_user_role(join_request.user_email, join_request.team_id))
-                asyncio.create_task(auth_cache.invalidate_user_teams(join_request.user_email))
-                asyncio.create_task(auth_cache.invalidate_team_membership(join_request.user_email))
-                asyncio.create_task(admin_stats_cache.invalidate_teams())
+                self._fire_and_forget(auth_cache.invalidate_team(join_request.user_email))
+                self._fire_and_forget(auth_cache.invalidate_user_role(join_request.user_email, join_request.team_id))
+                self._fire_and_forget(auth_cache.invalidate_user_teams(join_request.user_email))
+                self._fire_and_forget(auth_cache.invalidate_team_membership(join_request.user_email))
+                self._fire_and_forget(admin_stats_cache.invalidate_teams())
             except Exception as cache_error:
                 logger.debug(f"Failed to invalidate caches on join approval: {cache_error}")
 
@@ -1383,11 +1825,7 @@ class TeamManagementService:
         if not cache_enabled:
             return self.get_member_counts_batch(team_ids)
 
-        # Import Redis client lazily
         try:
-            # First-Party
-            from mcpgateway.utils.redis_client import get_redis_client  # pylint: disable=import-outside-toplevel
-
             redis_client = await get_redis_client()
         except Exception:
             redis_client = None
@@ -1460,9 +1898,6 @@ class TeamManagementService:
             return
 
         try:
-            # First-Party
-            from mcpgateway.utils.redis_client import get_redis_client  # pylint: disable=import-outside-toplevel
-
             redis_client = await get_redis_client()
             if redis_client:
                 await redis_client.delete(self._get_member_count_cache_key(team_id))

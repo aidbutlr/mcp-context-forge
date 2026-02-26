@@ -78,6 +78,7 @@
   {% set base_url = root_path + '/admin/metrics/partial' %}
   {% set hx_target = '#top-' + entity_type + '-content-visible' %}
   {% set hx_indicator = '#top-' + entity_type + '-loading-visible' %}
+  {% set table_name = 'metrics_' + entity_type %}
   {% set query_params = {'entity_type': entity_type} %}
   {% include 'pagination_controls.html' %}
 </div>

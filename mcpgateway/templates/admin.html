@@ -1,9 +1,9 @@
 <!doctype html>
 <html
   lang="en"
-  x-data="{ darkMode: JSON.parse(localStorage.getItem('darkMode') || 'false') }"
+  x-data="{ darkMode: (() => { try { return JSON.parse(localStorage.getItem('darkMode') || 'false') } catch(e) { if (typeof _logRestrictedContext === 'function') _logRestrictedContext(e); return false } })() }"
   x-bind:class="darkMode ? 'dark' : ''"
-  x-init="$watch('darkMode', val => localStorage.setItem('darkMode', val))"
+  x-init="$watch('darkMode', val => { try { localStorage.setItem('darkMode', val) } catch(e) { if (typeof _logRestrictedContext === 'function') _logRestrictedContext(e); } })"
 >
   <head>
     <meta charset="UTF-8" />
@@ -36,6 +36,26 @@
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     {% endif %}
     <script>
+      // Configure HTMX to swap content on 4xx responses (for inline error display)
+      document.addEventListener("htmx:beforeSwap", function (evt) {
+        const xhr = evt.detail.xhr;
+        if (!xhr || xhr.status < 400 || xhr.status >= 500) {
+          return;
+        }
+        const triggerEl = evt.detail.elt;
+        const requestEl = evt.detail.requestConfig?.elt;
+        const isTeamForm =
+          (triggerEl &&
+            triggerEl.closest('[data-team-validation="true"]')) ||
+          (requestEl &&
+            requestEl.closest('[data-team-validation="true"]'));
+        const hasRetarget = !!xhr.getResponseHeader("HX-Retarget");
+        if (isTeamForm || hasRetarget) {
+          evt.detail.shouldSwap = true;
+          evt.detail.isError = false;
+        }
+      });
+
       // Configure HTMX to include credentials and JWT tokens
       document.addEventListener("htmx:configRequest", function (evt) {
         // Force include credentials for same-origin requests
@@ -53,6 +73,100 @@
         const value = "; " + document.cookie;
         const parts = value.split("; " + name + "=");
         if (parts.length == 2) return parts.pop().split(";").shift();
+      }
+
+      // Helper function to get pagination parameters from URL (namespaced per table)
+      function getPaginationParams(tableName) {
+        const urlParams = new URLSearchParams(window.location.search);
+        const prefix = tableName + '_';
+        return {
+          page: Math.max(1, parseInt(urlParams.get(prefix + 'page'), 10) || 1),
+          perPage: Math.max(1, parseInt(urlParams.get(prefix + 'size'), 10) || 10),
+          includeInactive: urlParams.get(prefix + 'inactive')
+        };
+      }
+
+      // Helper function to build table URL with pagination params (namespaced per table)
+      // URL state takes precedence over checkbox state for shareability
+      function buildTableUrl(tableName, baseUrl, additionalParams = {}) {
+        const params = getPaginationParams(tableName);
+        const urlParams = new URLSearchParams(window.location.search);
+        const prefix = tableName + '_';
+        const url = new URL(baseUrl, window.location.origin);
+        url.searchParams.set('page', params.page);
+        url.searchParams.set('per_page', params.perPage);
+
+        // Add additional parameters, but URL state takes precedence for include_inactive
+        for (const [key, value] of Object.entries(additionalParams)) {
+          if (key === 'include_inactive' && params.includeInactive !== null) {
+            // URL state overrides checkbox state for shareability
+            url.searchParams.set('include_inactive', params.includeInactive);
+          } else if (value !== null && value !== undefined && value !== '') {
+            url.searchParams.set(key, value);
+          }
+        }
+
+        // If include_inactive wasn't in additionalParams but is in URL, still use it
+        if (!additionalParams.hasOwnProperty('include_inactive') && params.includeInactive !== null) {
+          url.searchParams.set('include_inactive', params.includeInactive);
+        }
+
+        // Preserve namespaced search state for shareable URLs
+        const namespacedQuery = urlParams.get(prefix + 'q');
+        const namespacedTags = urlParams.get(prefix + 'tags');
+        if (namespacedQuery) {
+          url.searchParams.set('q', namespacedQuery);
+        }
+        if (namespacedTags) {
+          url.searchParams.set('tags', namespacedTags);
+        }
+
+        return url.pathname + url.search;
+      }
+
+      // Sync checkbox state from URL on page load (for shareable links)
+      function syncCheckboxFromUrl(tableName, checkboxId) {
+        const params = getPaginationParams(tableName);
+        if (params.includeInactive !== null) {
+          const checkbox = document.getElementById(checkboxId);
+          if (checkbox) {
+            checkbox.checked = params.includeInactive === 'true';
+          }
+        }
+      }
+
+      // Update URL when checkbox is toggled (namespaced)
+      // Also resets page to 1 since HTMX reloads from page 1 when filter changes
+      // Preserves params from other tables to avoid mixing/overwriting
+      function updateInactiveUrlState(tableName, checked) {
+        const currentUrl = new URL(window.location.href);
+        const newParams = new URLSearchParams(currentUrl.searchParams);
+        const prefix = tableName + '_';
+
+        // Update current table's params only
+        newParams.set(prefix + 'inactive', checked.toString());
+        newParams.set(prefix + 'page', '1');  // Reset to page 1 when filter changes
+
+        const newUrl = currentUrl.pathname + '?' + newParams.toString() + currentUrl.hash;
+        safeReplaceState({}, '', newUrl);
+      }
+
+      // One-time debug notice for restricted iframe contexts (e.g. sandboxed iframes)
+      var _restrictedContextLogged = false;
+      function _logRestrictedContext(e) {
+        if (!_restrictedContextLogged) {
+          _restrictedContextLogged = true;
+          console.debug('Running in restricted context — storage/history APIs unavailable:', e.message);
+        }
+      }
+
+      // Safe wrapper for history.replaceState — skips in restricted contexts
+      function safeReplaceState(data, title, url) {
+        try {
+          window.history.replaceState(data, title, url);
+        } catch (e) {
+          _logRestrictedContext(e);
+        }
       }
     </script>
 
@@ -167,6 +281,8 @@
   </head>
 
   <body class="bg-gray-100 dark:bg-gray-900">
+    {% set hidden_sections = ui_hidden_sections | default([]) %}
+    {% set hidden_header_items = ui_hidden_header_items | default([]) %}
     <div class="flex h-screen overflow-hidden" x-data="{ sidebarOpen: true, sidebarCollapsed: false }">
 
       <!-- Mobile sidebar backdrop -->
@@ -228,6 +344,7 @@
         <nav class="flex-1 overflow-y-auto py-4 sidebar-scroll">
           <!-- Overview Section -->
           <div class="space-y-1 px-2 mb-4">
+            {% if 'overview' not in hidden_sections %}
             <a href="#overview" id="tab-overview" data-testid="overview-tab"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors active"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -235,6 +352,7 @@
               <span class="sidebar-icon text-lg" :class="{ 'mr-3': !sidebarCollapsed }">📊</span>
               <span x-show="!sidebarCollapsed">Overview</span>
             </a>
+            {% endif %}
           </div>
 
           <!-- MCP Section -->
@@ -242,6 +360,7 @@
             <span class="px-3 text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider">MCP</span>
           </div>
           <div class="space-y-1 px-2">
+            {% if 'gateways' not in hidden_sections %}
             <a href="#gateways" id="tab-gateways" data-testid="gateways-tab"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -249,6 +368,8 @@
               <span class="sidebar-icon text-lg" :class="{ 'mr-3': !sidebarCollapsed }">🖥️</span>
               <span x-show="!sidebarCollapsed">MCP Servers</span>
             </a>
+            {% endif %}
+            {% if 'servers' not in hidden_sections %}
             <a href="#catalog" id="tab-catalog" data-testid="servers-tab"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -256,6 +377,8 @@
               <span class="sidebar-icon text-lg" :class="{ 'mr-3': !sidebarCollapsed }">🔗</span>
               <span x-show="!sidebarCollapsed">Virtual Servers</span>
             </a>
+            {% endif %}
+            {% if 'tools' not in hidden_sections %}
             <a href="#tools" id="tab-tools" data-testid="tools-tab"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -272,6 +395,8 @@
               <span x-show="!sidebarCollapsed">ToolOps</span>
             </a>
             {% endif %}
+            {% endif %}
+            {% if 'prompts' not in hidden_sections %}
             <a href="#prompts" id="tab-prompts"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -279,6 +404,8 @@
               <span class="sidebar-icon text-lg" :class="{ 'mr-3': !sidebarCollapsed }">💬</span>
               <span x-show="!sidebarCollapsed">Prompts</span>
             </a>
+            {% endif %}
+            {% if 'resources' not in hidden_sections %}
             <a href="#resources" id="tab-resources"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -286,6 +413,8 @@
               <span class="sidebar-icon text-lg" :class="{ 'mr-3': !sidebarCollapsed }">📁</span>
               <span x-show="!sidebarCollapsed">Resources</span>
             </a>
+            {% endif %}
+            {% if 'roots' not in hidden_sections %}
             <a href="#roots" id="tab-roots"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -293,6 +422,8 @@
               <span class="sidebar-icon text-lg" :class="{ 'mr-3': !sidebarCollapsed }">🌳</span>
               <span x-show="!sidebarCollapsed">Roots</span>
             </a>
+            {% endif %}
+            {% if 'mcp-registry' not in hidden_sections %}
             <a href="#mcp-registry" id="tab-mcp-registry" data-testid="mcp-registry-tab"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -300,10 +431,11 @@
               <span class="sidebar-icon text-lg" :class="{ 'mr-3': !sidebarCollapsed }">📦</span>
               <span x-show="!sidebarCollapsed">MCP Registry</span>
             </a>
+            {% endif %}
           </div>
 
           <!-- Agents Section -->
-          {% if a2a_enabled or grpc_enabled %}
+          {% if ('agents' not in hidden_sections) and (a2a_enabled or grpc_enabled) %}
           <div class="sidebar-section mt-4" x-show="!sidebarCollapsed">
             <span class="px-3 text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider">Agents</span>
           </div>
@@ -330,11 +462,12 @@
           {% endif %}
 
           <!-- LLM Section -->
-          {% if llmchat_enabled %}
+          {% if llmchat_enabled or 'settings' not in hidden_sections %}
           <div class="sidebar-section mt-4" x-show="!sidebarCollapsed">
             <span class="px-3 text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider">LLM</span>
           </div>
           <div class="space-y-1 px-2">
+            {% if llmchat_enabled %}
             <a href="#llm-chat" id="tab-llm-chat" data-testid="llm-chat-tab"
               class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -342,6 +475,8 @@
               <span class="sidebar-icon text-lg" :class="{ 'mr-3': !sidebarCollapsed }">👨‍💻</span>
               <span x-show="!sidebarCollapsed">LLM Chat</span>
             </a>
+            {% endif %}
+            {% if 'settings' not in hidden_sections %}
             <a href="#llm-settings" id="tab-llm-settings"
               class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -349,15 +484,17 @@
               <span class="sidebar-icon text-lg" :class="{ 'mr-3': !sidebarCollapsed }">⚙️</span>
               <span x-show="!sidebarCollapsed">LLM Settings</span>
             </a>
+            {% endif %}
           </div>
           {% endif %}
 
-          {% if is_admin %}
+          {% if is_admin and ('metrics' not in hidden_sections or performance_enabled or observability_enabled) %}
           <!-- Monitoring Section -->
           <div class="sidebar-section mt-4" x-show="!sidebarCollapsed">
             <span class="px-3 text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider">Monitoring</span>
           </div>
           <div class="space-y-1 px-2">
+            {% if 'metrics' not in hidden_sections %}
             <a href="#metrics" id="tab-metrics"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -365,6 +502,7 @@
               <span class="sidebar-icon text-lg" :class="{ 'mr-3': !sidebarCollapsed }">📊</span>
               <span x-show="!sidebarCollapsed">Metrics</span>
             </a>
+            {% endif %}
             {% if performance_enabled %}
             <a href="#performance" id="tab-performance" data-testid="performance-tab"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
@@ -386,12 +524,13 @@
           </div>
           {% endif %}
 
-          {% if is_admin %}
+          {% if is_admin and 'plugins' not in hidden_sections %}
           <!-- Extensions Section -->
           <div class="sidebar-section mt-4" x-show="!sidebarCollapsed">
             <span class="px-3 text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider">Extensions</span>
           </div>
           <div class="space-y-1 px-2">
+            {% if 'plugins' not in hidden_sections %}
             <a href="#plugins" id="tab-plugins" data-testid="plugins-tab"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -399,15 +538,17 @@
               <span class="sidebar-icon text-lg" :class="{ 'mr-3': !sidebarCollapsed }">🧩</span>
               <span x-show="!sidebarCollapsed">Plugins</span>
             </a>
+            {% endif %}
           </div>
           {% endif %}
 
           <!-- Organization Section -->
-          {% if email_auth_enabled %}
+          {% if email_auth_enabled and ('teams' not in hidden_sections or ('users' not in hidden_sections and is_admin) or 'tokens' not in hidden_sections) %}
           <div class="sidebar-section mt-4" x-show="!sidebarCollapsed">
             <span class="px-3 text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider">Organization</span>
           </div>
           <div class="space-y-1 px-2">
+            {% if 'teams' not in hidden_sections %}
             <a href="#teams" id="tab-teams" data-testid="teams-tab"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -415,7 +556,8 @@
               <span class="sidebar-icon text-lg" :class="{ 'mr-3': !sidebarCollapsed }">👥</span>
               <span x-show="!sidebarCollapsed">Teams</span>
             </a>
-            {% if is_admin %}
+            {% endif %}
+            {% if is_admin and 'users' not in hidden_sections %}
             <a href="#users" id="tab-users"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -424,6 +566,7 @@
               <span x-show="!sidebarCollapsed">Users</span>
             </a>
             {% endif %}
+            {% if 'tokens' not in hidden_sections %}
             <a href="#tokens" id="tab-tokens"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -431,15 +574,17 @@
               <span class="sidebar-icon text-lg" :class="{ 'mr-3': !sidebarCollapsed }">🎫</span>
               <span x-show="!sidebarCollapsed">API Tokens</span>
             </a>
+            {% endif %}
           </div>
           {% endif %}
 
-          {% if is_admin %}
+          {% if is_admin and ('export-import' not in hidden_sections or 'logs' not in hidden_sections or 'version-info' not in hidden_sections or 'maintenance' not in hidden_sections) %}
           <!-- Admin Section -->
           <div class="sidebar-section mt-4" x-show="!sidebarCollapsed">
             <span class="px-3 text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider">Admin</span>
           </div>
           <div class="space-y-1 px-2">
+            {% if 'export-import' not in hidden_sections %}
             <a href="#export-import" id="tab-export-import"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -447,6 +592,8 @@
               <span class="sidebar-icon text-lg" :class="{ 'mr-3': !sidebarCollapsed }">📤</span>
               <span x-show="!sidebarCollapsed">Export/Import</span>
             </a>
+            {% endif %}
+            {% if 'logs' not in hidden_sections %}
             <a href="#logs" id="tab-logs"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -454,6 +601,8 @@
               <span class="sidebar-icon text-lg" :class="{ 'mr-3': !sidebarCollapsed }">📋</span>
               <span x-show="!sidebarCollapsed">System Logs</span>
             </a>
+            {% endif %}
+            {% if 'version-info' not in hidden_sections %}
             <a href="#version-info" id="tab-version-info"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -461,6 +610,8 @@
               <span class="sidebar-icon text-lg" :class="{ 'mr-3': !sidebarCollapsed }">ℹ️</span>
               <span x-show="!sidebarCollapsed">Version Info</span>
             </a>
+            {% endif %}
+            {% if 'maintenance' not in hidden_sections %}
             <a href="#maintenance" id="tab-maintenance"
                class="sidebar-link group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors"
                :class="{ 'justify-center': sidebarCollapsed }"
@@ -468,6 +619,7 @@
               <span class="sidebar-icon text-lg" :class="{ 'mr-3': !sidebarCollapsed }">🔧</span>
               <span x-show="!sidebarCollapsed">Maintenance</span>
             </a>
+            {% endif %}
           </div>
           {% endif %}
         </nav>
@@ -476,6 +628,7 @@
         <div class="flex-shrink-0 border-t border-gray-200 dark:border-gray-700 p-4">
           <div class="flex items-center" :class="{ 'justify-center': sidebarCollapsed, 'justify-between': !sidebarCollapsed }">
             <!-- Dark mode toggle -->
+            {% if 'theme_toggle' not in hidden_header_items %}
             <button
               @click="darkMode = !darkMode"
               class="p-2 rounded-lg text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
@@ -483,6 +636,7 @@
             >
               <span x-text="darkMode ? '☀️' : '🌙'" class="text-lg"></span>
             </button>
+            {% endif %}
             <!-- Links (hidden when collapsed) -->
             <div x-show="!sidebarCollapsed" class="flex items-center space-x-2">
               <a href="https://ibm.github.io/mcp-context-forge/" target="_blank"
@@ -525,29 +679,54 @@
 
             <!-- Right side: team selector, user, logout -->
             <div class="flex items-center space-x-4">
-              <!-- Team Selector -->
-              {% if email_auth_enabled %}
+              <button
+                type="button"
+                id="global-search-trigger"
+                onclick="openGlobalSearchModal()"
+                class="inline-flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 rounded-md hover:border-gray-400 dark:hover:border-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                title="Search across tools, prompts, resources, servers, gateways, and agents (Ctrl/Cmd+K)"
+              >
+                <span>Search</span>
+                <span class="hidden sm:inline text-xs text-gray-500 dark:text-gray-400">Ctrl/Cmd+K</span>
+              </button>
+
+              <!-- Team Selector with Search and Infinite Scroll -->
+              {% if email_auth_enabled and 'team_selector' not in hidden_header_items %}
               <div
                 class="relative inline-block text-left"
                 x-data="{
                   open: false,
                   selectedTeam: '',
                   selectedTeamName: 'All Teams',
-                  teams: [],
                   init() {
-                    this.teams = window.USER_TEAMS_DATA || [];
                     const urlParams = new URLSearchParams(window.location.search);
                     this.selectedTeam = urlParams.get('team_id') || '';
                     if (this.selectedTeam) {
-                      const team = this.teams.find(t => t.id === this.selectedTeam);
+                      // Try to find team name from USER_TEAMS_DATA
+                      const teams = window.USER_TEAMS_DATA || [];
+                      const team = teams.find(t => t.id === this.selectedTeam);
                       this.selectedTeamName = team ? (team.is_personal ? '👤 ' + team.name : '🏢 ' + team.name) : 'All Teams';
+                    }
+                  },
+                  loadTeams() {
+                    // Load teams via HTMX when dropdown opens
+                    if (this.open) {
+                      const container = document.getElementById('team-selector-items');
+                      if (container && !container.dataset.loaded) {
+                        htmx.ajax('GET', '{{ root_path }}/admin/teams/partial?page=1&per_page=10&render=selector', {
+                          target: '#team-selector-items',
+                          swap: 'innerHTML'
+                        });
+                        container.dataset.loaded = 'true';
+                      }
                     }
                   }
                 }"
+                @click.away="open = false"
               >
                 <button
                   type="button"
-                  @click="open = !open"
+                  @click="open = !open; $nextTick(() => loadTeams())"
                   id="team-selector-button"
                   aria-expanded="false"
                   aria-haspopup="true"
@@ -561,53 +740,68 @@
 
                 <div
                   x-show="open"
-                  @click.away="open = false"
                   x-transition:enter="transition ease-out duration-100"
                   x-transition:enter-start="transform opacity-0 scale-95"
                   x-transition:enter-end="transform opacity-100 scale-100"
                   x-transition:leave="transition ease-in duration-75"
                   x-transition:leave-start="transform opacity-100 scale-100"
                   x-transition:leave-end="transform opacity-0 scale-95"
-                  class="origin-top-right absolute right-0 mt-2 w-64 max-h-60 overflow-y-auto rounded-md shadow-lg bg-white dark:bg-gray-800 ring-1 ring-black ring-opacity-5 divide-y divide-gray-100 dark:divide-gray-700 z-50"
+                  class="origin-top-right absolute right-0 mt-2 w-72 rounded-md shadow-lg bg-white dark:bg-gray-800 ring-1 ring-black ring-opacity-5 z-50"
                   role="menu"
                   aria-orientation="vertical"
                   aria-labelledby="team-selector-button"
                   style="display: none"
                 >
-                  <div class="py-1" role="none">
+                  <!-- Search Input -->
+                  <div class="p-2 border-b border-gray-200 dark:border-gray-700">
+                    <input
+                      type="text"
+                      id="team-selector-search"
+                      placeholder="Search teams..."
+                      class="w-full px-3 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                      oninput="searchTeamSelector(this.value)"
+                      @click.stop
+                    />
+                  </div>
+
+                  <!-- All Teams Option -->
+                  <div class="border-b border-gray-200 dark:border-gray-700">
                     <button
+                      type="button"
                       @click="selectedTeam = ''; selectedTeamName = 'All Teams'; open = false; updateTeamContext('')"
                       class="w-full text-left px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700"
                       role="menuitem"
                     >
                       🌐 All Teams
                     </button>
+                  </div>
 
-                    <template x-for="team in teams" :key="team.id">
-                      <button
-                        @click="selectedTeam = team.id; selectedTeamName = (team.is_personal ? '👤 ' : '🏢 ') + team.name; open = false; updateTeamContext(team.id)"
-                        class="w-full text-left px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700"
-                        role="menuitem"
-                        x-bind:class="selectedTeam === team.id ? 'bg-blue-50 dark:bg-blue-900' : ''"
-                      >
-                        <span x-text="(team.is_personal ? '👤 ' : '🏢 ') + team.name"></span>
-                        <span class="text-xs text-gray-500 dark:text-gray-400 ml-2" x-text="team.member_count + ' members'"></span>
-                      </button>
-                    </template>
+                  <!-- Teams List with Infinite Scroll -->
+                  <div
+                    id="team-selector-items"
+                    class="max-h-48 overflow-y-auto"
+                    role="none"
+                  >
+                    <div class="text-center py-4 text-sm text-gray-500 dark:text-gray-400">
+                      Loading teams...
+                    </div>
                   </div>
                 </div>
               </div>
               {% endif %}
 
               <!-- User Email -->
+              {% if 'user_identity' not in hidden_header_items %}
               <div class="text-sm text-gray-600 dark:text-gray-400 flex items-center hidden sm:flex">
                 <svg class="w-4 h-4 mr-2" fill="currentColor" viewBox="0 0 20 20">
                   <path d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" />
                 </svg>
                 {{ current_user }}
               </div>
+              {% endif %}
 
               <!-- Logout -->
+              {% if 'logout' not in hidden_header_items %}
               <form method="post" action="{{ root_path }}/admin/logout" class="inline">
                 <button
                   type="submit"
@@ -617,6 +811,7 @@
                   Logout
                 </button>
               </form>
+              {% endif %}
             </div>
           </div>
         </header>
@@ -626,10 +821,33 @@
           <!-- Notification content will be inserted here -->
         </div>
 
+        <!-- Global Search Modal -->
+        <div id="global-search-modal" class="fixed inset-0 z-50 hidden" aria-hidden="true">
+          <div class="absolute inset-0 bg-black/40" onclick="closeGlobalSearchModal()"></div>
+          <div class="relative max-w-3xl mx-auto mt-24 px-4">
+            <div class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-xl overflow-hidden">
+              <div class="p-4 border-b border-gray-200 dark:border-gray-700">
+                <input
+                  type="text"
+                  id="global-search-input"
+                  placeholder="Search across servers, gateways, tools, resources, prompts, and agents..."
+                  class="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  autocomplete="off"
+                />
+              </div>
+              <div id="global-search-results" class="max-h-[28rem] overflow-y-auto">
+                <div class="p-4 text-sm text-gray-500 dark:text-gray-400">
+                  Start typing to search all entities.
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <!-- Tab Panels Container -->
         <main class="flex-1 overflow-y-auto bg-gray-100 dark:bg-gray-900 p-4 lg:p-6">
 
-      {% if is_admin %}
+      {% if is_admin and 'logs' not in hidden_sections %}
       <!-- Logs Panel -->
       <div id="logs-panel" class="tab-panel hidden">
           <div class="bg-white dark:bg-gray-800 shadow rounded-lg">
@@ -756,7 +974,13 @@
                 id="log-stats"
                 class="mb-4 p-3 bg-gray-100 dark:bg-gray-700 rounded text-gray-700 dark:text-gray-300"
               >
-                <span class="text-sm">Loading...</span>
+                <div class="flex items-center justify-center p-4">
+                  <svg class="animate-spin h-8 w-8 text-indigo-600 dark:text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                  <span class="ml-2 text-gray-600 dark:text-gray-400">Loading logs...</span>
+                </div>
               </div>
 
               <!-- Log Table -->
@@ -844,7 +1068,7 @@
       </div>
       {% endif %}
 
-      {% if is_admin %}
+      {% if is_admin and 'export-import' not in hidden_sections %}
       <!-- Export/Import Panel -->
       <div id="export-import-panel" class="tab-panel hidden">
           <div class="bg-white dark:bg-gray-800 shadow rounded-lg">
@@ -1132,6 +1356,7 @@
                         <input
                           type="password"
                           id="import-rekey-secret"
+                          autocomplete="off"
                           placeholder="New encryption secret (optional)"
                           class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
                         />
@@ -1273,14 +1498,19 @@
             </div>
           </div>
       </div>
+      {% endif %}
+
+      {% if is_admin and 'version-info' not in hidden_sections %}
       <!-- Version Info Panel -->
       <div id="version-info-panel" class="tab-panel hidden"></div>
+      {% endif %}
 
+      {% if is_admin and 'maintenance' not in hidden_sections %}
       <!-- Maintenance Panel (admin only) -->
       <div id="maintenance-panel" class="tab-panel hidden"></div>
       {% endif %}
 
-      {% if is_admin %}
+      {% if is_admin and 'plugins' not in hidden_sections %}
       <!-- Plugins Panel -->
       <div id="plugins-panel" class="tab-panel hidden"></div>
       {% endif %}
@@ -1614,7 +1844,9 @@
             </div>
           </div>
         </div>
+        {% endif %}
 
+        {% if 'settings' not in hidden_sections %}
         <!-- LLM Settings Panel -->
       <div id="llm-settings-panel" class="tab-panel hidden">
         <div class="container mx-auto">
@@ -1725,7 +1957,7 @@
                     <div class="grid grid-cols-2 gap-4">
                       <div>
                         <label for="llm-provider-name" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Name *</label>
-                        <input type="text" id="llm-provider-name" name="name" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm">
+                        <input type="text" id="llm-provider-name" name="name" required class="mt-1 px-1.5 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm">
                       </div>
                       <div>
                         <label for="llm-provider-type" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Provider Type *</label>
@@ -1749,7 +1981,7 @@
                     </div>
                     <div>
                       <label for="llm-provider-description" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Description</label>
-                      <textarea id="llm-provider-description" name="description" rows="2" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm"></textarea>
+                      <textarea id="llm-provider-description" name="description" rows="2" class="mt-1 px-1.5 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm"></textarea>
                     </div>
                     <div class="grid grid-cols-2 gap-4">
                       <div>
@@ -1757,26 +1989,26 @@
                           API Key
                           <span id="llm-provider-api-key-required" class="text-red-500 hidden">*</span>
                         </label>
-                        <input type="password" id="llm-provider-api-key" name="api_key" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="Leave blank to keep existing">
+                        <input type="password" id="llm-provider-api-key" name="api_key" autocomplete="off" class="mt-1 px-1.5 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="Leave blank to keep existing">
                       </div>
                       <div>
                         <label for="llm-provider-api-base" class="block text-sm font-medium text-gray-700 dark:text-gray-300">API Base URL</label>
-                        <input type="text" id="llm-provider-api-base" name="api_base" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="Auto-filled based on provider type">
+                        <input type="text" id="llm-provider-api-base" name="api_base" class="mt-1 px-1.5 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="Auto-filled based on provider type">
                         <p class="mt-1 text-xs text-gray-400">Will be auto-filled when you select a provider type</p>
                       </div>
                     </div>
                     <div class="grid grid-cols-3 gap-4">
                       <div>
                         <label for="llm-provider-default-model" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Default Model</label>
-                        <input type="text" id="llm-provider-default-model" name="default_model" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="gpt-4o">
+                        <input type="text" id="llm-provider-default-model" name="default_model" class="mt-1 px-1.5 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="gpt-4o">
                       </div>
                       <div>
                         <label for="llm-provider-temperature" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Temperature</label>
-                        <input type="number" id="llm-provider-temperature" name="default_temperature" step="0.1" min="0" max="2" value="0.7" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm">
+                        <input type="number" id="llm-provider-temperature" name="default_temperature" step="0.1" min="0" max="2" value="0.7" class="mt-1 px-1.5 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm">
                       </div>
                       <div>
                         <label for="llm-provider-max-tokens" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Max Tokens</label>
-                        <input type="number" id="llm-provider-max-tokens" name="default_max_tokens" min="1" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="4096">
+                        <input type="number" id="llm-provider-max-tokens" name="default_max_tokens" min="1" class="mt-1 px-1.5 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="4096">
                       </div>
                     </div>
                     <!-- Dynamic Provider-Specific Configuration Fields -->
@@ -1830,7 +2062,7 @@
                       <div>
                         <label for="llm-model-model-id" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Model ID *</label>
                         <div class="flex mt-1">
-                          <input type="text" id="llm-model-model-id" name="model_id" required list="llm-model-suggestions" class="block w-full rounded-l-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="Select provider first...">
+                          <input type="text" id="llm-model-model-id" name="model_id" required list="llm-model-suggestions" class="px-1.5 block w-full rounded-l-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="Select provider first...">
                           <datalist id="llm-model-suggestions"></datalist>
                           <button type="button" onclick="fetchModelsForModelModal()" class="inline-flex items-center px-3 py-2 border border-l-0 border-gray-300 rounded-r-md bg-gray-50 text-gray-500 hover:bg-gray-100 dark:bg-gray-600 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-500" title="Fetch available models">
                             <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1844,25 +2076,25 @@
                     <div class="grid grid-cols-2 gap-4">
                       <div>
                         <label for="llm-model-name" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Display Name *</label>
-                        <input type="text" id="llm-model-name" name="model_name" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="GPT-4o">
+                        <input type="text" id="llm-model-name" name="model_name" required class="mt-1 px-1.5 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="GPT-4o">
                       </div>
                       <div>
                         <label for="llm-model-alias" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Alias</label>
-                        <input type="text" id="llm-model-alias" name="model_alias" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="Optional alias">
+                        <input type="text" id="llm-model-alias" name="model_alias" class="mt-1 px-1.5 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="Optional alias">
                       </div>
                     </div>
                     <div>
                       <label for="llm-model-description" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Description</label>
-                      <textarea id="llm-model-description" name="description" rows="2" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm"></textarea>
+                      <textarea id="llm-model-description" name="description" rows="2" class="mt-1 px-1.5 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm"></textarea>
                     </div>
                     <div class="grid grid-cols-2 gap-4">
                       <div>
                         <label for="llm-model-context-window" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Context Window</label>
-                        <input type="number" id="llm-model-context-window" name="context_window" min="1" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="128000">
+                        <input type="number" id="llm-model-context-window" name="context_window" min="1" class="mt-1 px-1.5 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="128000">
                       </div>
                       <div>
                         <label for="llm-model-max-output" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Max Output Tokens</label>
-                        <input type="number" id="llm-model-max-output" name="max_output_tokens" min="1" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="4096">
+                        <input type="number" id="llm-model-max-output" name="max_output_tokens" min="1" class="mt-1 px-1.5 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white sm:text-sm" placeholder="4096">
                       </div>
                     </div>
                     <div class="grid grid-cols-2 gap-4">
@@ -1918,18 +2150,18 @@
       </div>
       {% endif %}
 
+      {% if 'mcp-registry' not in hidden_sections %}
       <!-- MCP Registry Panel -->
       <div id="mcp-registry-panel" class="tab-panel hidden">
         <div class="container mx-auto">
           <!-- Server Grid (includes filters and overview) -->
           <div id="mcp-registry-servers">
-            <div class="text-center py-8">
-              <div
-                class="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-gray-900 dark:border-gray-100"
-              ></div>
-              <p class="mt-2 text-gray-600 dark:text-gray-400">
-                Loading MCP Registry servers...
-              </p>
+            <div class="flex items-center justify-center p-4">
+              <svg class="animate-spin h-8 w-8 text-indigo-600 dark:text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+              <span class="ml-2 text-gray-600 dark:text-gray-400">Loading MCP Registry servers...</span>
             </div>
           </div>
         </div>
@@ -1970,6 +2202,7 @@
                   <input
                     type="password"
                     id="modal-api-key"
+                    autocomplete="off"
                     class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                     placeholder="Enter your API key"
                     required
@@ -1995,9 +2228,17 @@
           </div>
         </div>
       </div>
+      {% endif %}
 
+      {% if 'servers' not in hidden_sections %}
       <!-- Catalog Panel (Virtual Servers) -->
       <div id="catalog-panel" class="tab-panel hidden">
+        {% if not catalog_enabled %}
+        <div class="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 mb-6 dark:bg-yellow-800 dark:border-yellow-400 dark:text-yellow-200">
+          <p class="font-bold">Catalog is currently disabled</p>
+          <p class="text-sm">Set <code>MCPGATEWAY_CATALOG_ENABLED=true</code> to enable catalog-backed server operations.</p>
+        </div>
+        {% endif %}
         <div class="flex justify-between items-center mb-4">
           <div class="flex items-center space-x-10">
             <h2 class="text-2xl font-bold dark:text-gray-200">Virtual MCP Servers</h2>
@@ -2010,8 +2251,16 @@
             <input
               type="checkbox"
               id="show-inactive-servers"
-              class="mr-2"
-              onchange="toggleInactiveItems('servers')"
+              class="mr-2 show-inactive-toggle"
+              name="include_inactive"
+              x-init="syncCheckboxFromUrl('servers', 'show-inactive-servers')"
+              @change="updateInactiveUrlState('servers', $el.checked)"
+              hx-get="{{ root_path }}/admin/servers/partial?page=1{% if selected_team_id %}&team_id={{ selected_team_id }}{% endif %}"
+              hx-vals="js:{include_inactive: document.getElementById('show-inactive-servers').checked, per_page: document.querySelector('#servers-pagination-controls select')?.value || 50, q: document.getElementById('catalog-search-input')?.value || '', tags: document.getElementById('catalog-tag-filter')?.value || ''}"
+              hx-target="#servers-table"
+              hx-swap="outerHTML"
+              hx-indicator="#servers-loading"
+              hx-trigger="change"
             />
             <label
               for="show-inactive-servers"
@@ -2033,7 +2282,7 @@
                   type="text"
                   id="catalog-search-input"
                   data-testid="search-input"
-                  placeholder="Search servers via tags..."
+                  placeholder="Search servers..."
                   class="w-64 px-3 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-300 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
                   oninput="filterServerTable(this.value)"
                 />
@@ -2070,18 +2319,11 @@
           <div class="overflow-x-auto">
             <!-- Table will be loaded via HTMX -->
             <div id="servers-table"
-                 hx-get="{{ root_path }}/admin/servers/partial?page=1&per_page=20&include_inactive={{ include_inactive|default(false)|string|lower }}{% if selected_team_id %}&team_id={{ selected_team_id }}{% endif %}"
+                 x-init="$el.setAttribute('hx-get', buildTableUrl('servers', '{{ root_path }}/admin/servers/partial', {include_inactive: (document.getElementById('show-inactive-servers')?.checked ?? false).toString(){% if selected_team_id %}, team_id: '{{ selected_team_id }}'{% endif %}}))"
                  hx-trigger="load"
                  hx-swap="outerHTML"
                  hx-indicator="#servers-loading">
-              <!-- Loading placeholder -->
-              <div class="flex items-center justify-center p-8">
-                <svg class="animate-spin h-8 w-8 text-indigo-600 dark:text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-                <span class="ml-3 text-gray-600 dark:text-gray-400">Loading servers...</span>
-              </div>
+
             </div>
           </div>
 
@@ -2132,8 +2374,8 @@
             {% set base_url = root_path + '/admin/servers/partial' %}
             {% set hx_target = '#servers-table' %}
             {% set hx_indicator = '#servers-loading' %}
+            {% set table_name = 'servers' %}
             {% set query_params = {'include_inactive': include_inactive} %}
-
             {% include 'pagination_controls.html' %}
           </div>
         </div>
@@ -2246,7 +2488,7 @@
                   <td
                     class="px-6 py-4 whitespace-normal break-words text-sm text-gray-500 dark:text-gray-300"
                   >
-                    {{ server.description }}
+                    {{ server.description | decode_html }}
                   </td>
                   <td
                     class="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-300"
@@ -2326,8 +2568,8 @@
                   </td>
                   <td class="px-2 py-4 whitespace-nowrap">
                     {% if server.team %}
-                    <span class="text-sm text-gray-900 dark:text-gray-100">
-                      {{ server.team.replace(' ', '<br />')|safe }}
+                    <span class="text-sm text-gray-900 dark:text-gray-100" style="display: block; white-space: normal; word-spacing: 9999px;">
+                      {{ server.team }}
                     </span>
                     {% else %}
                     <span class="text-gray-500 dark:text-gray-300 text-xs"
@@ -2389,7 +2631,7 @@
                         {% if server.enabled %}
                         <form
                           method="POST"
-                          action="{{ root_path }}/admin/servers/{{ server.id }}/toggle"
+                          action="{{ root_path }}/admin/servers/{{ server.id }}/state"
                           class="contents"
                           onsubmit="return handleToggleSubmit(event, 'servers')"
                         >
@@ -2405,7 +2647,7 @@
                         {% else %}
                         <form
                           method="POST"
-                          action="{{ root_path }}/admin/servers/{{ server.id }}/toggle"
+                          action="{{ root_path }}/admin/servers/{{ server.id }}/state"
                           class="contents"
                           onsubmit="return handleToggleSubmit(event, 'servers')"
                         >
@@ -2849,6 +3091,83 @@
                 </div>
               </div>
             </div>
+
+            <!-- OAuth 2.0 Configuration Section (RFC 9728) -->
+            <div class="mt-6 border-t border-gray-200 dark:border-gray-700 pt-4">
+              <div class="flex items-center mb-4">
+                <input
+                  type="checkbox"
+                  name="oauth_enabled"
+                  id="server-oauth-enabled"
+                  class="form-checkbox h-5 w-5 text-indigo-600 dark:bg-gray-800 dark:border-gray-600"
+                  onchange="document.getElementById('server-oauth-config-section').classList.toggle('hidden', !this.checked)"
+                />
+                <label
+                  for="server-oauth-enabled"
+                  class="ml-2 text-sm font-medium text-gray-700 dark:text-gray-400"
+                  >Enable OAuth 2.0 for MCP Client Authentication</label
+                >
+              </div>
+              <p class="text-xs text-gray-500 dark:text-gray-400 mb-3">
+                When enabled, MCP clients can authenticate using browser-based OAuth/SSO per RFC 9728.
+              </p>
+
+              <!-- OAuth Configuration Fields (hidden by default) -->
+              <div id="server-oauth-config-section" class="hidden space-y-4 pl-6 border-l-2 border-indigo-200 dark:border-indigo-800">
+                <div>
+                  <label
+                    class="block text-sm font-medium text-gray-700 dark:text-gray-400"
+                    for="server-oauth-authorization-server"
+                    >Authorization Server URL</label
+                  >
+                  <input
+                    type="url"
+                    name="oauth_authorization_server"
+                    id="server-oauth-authorization-server"
+                    placeholder="https://idp.example.com"
+                    class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
+                  />
+                  <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                    The OAuth 2.0 authorization server URL (e.g., your Identity Provider)
+                  </p>
+                </div>
+                <div>
+                  <label
+                    class="block text-sm font-medium text-gray-700 dark:text-gray-400"
+                    for="server-oauth-scopes"
+                    >Scopes (space-separated)</label
+                  >
+                  <input
+                    type="text"
+                    name="oauth_scopes"
+                    id="server-oauth-scopes"
+                    placeholder="openid profile email"
+                    class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
+                  />
+                  <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                    OAuth scopes to request (e.g., openid profile email)
+                  </p>
+                </div>
+                <div>
+                  <label
+                    class="block text-sm font-medium text-gray-700 dark:text-gray-400"
+                    for="server-oauth-token-endpoint"
+                    >Token Endpoint URL (optional)</label
+                  >
+                  <input
+                    type="url"
+                    name="oauth_token_endpoint"
+                    id="server-oauth-token-endpoint"
+                    placeholder="https://idp.example.com/oauth/token"
+                    class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
+                  />
+                  <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                    Leave blank to use standard discovery from authorization server
+                  </p>
+                </div>
+              </div>
+            </div>
+
             <div class="mt-6">
               <button
                 type="submit"
@@ -2864,6 +3183,8 @@
 
 
 
+      {% endif %}
+      {% if 'tools' not in hidden_sections %}
       <!-- Tools Panel -->
       <div id="tools-panel" class="tab-panel hidden">
         <div class="flex justify-between items-center mb-4">
@@ -2898,8 +3219,16 @@
             <input
               type="checkbox"
               id="show-inactive-tools"
-              class="mr-2"
-              onchange="toggleInactiveItems('tools')"
+              class="mr-2 show-inactive-toggle"
+              name="include_inactive"
+              x-init="syncCheckboxFromUrl('tools', 'show-inactive-tools')"
+              @change="updateInactiveUrlState('tools', $el.checked)"
+              hx-get="{{ root_path }}/admin/tools/partial?page=1{% if selected_team_id %}&team_id={{ selected_team_id }}{% endif %}"
+              hx-vals="js:{include_inactive: document.getElementById('show-inactive-tools').checked, per_page: document.querySelector('#tools-pagination-controls select')?.value || 50, q: document.getElementById('tools-search-input')?.value || '', tags: document.getElementById('tools-tag-filter')?.value || ''}"
+              hx-target="#tools-table"
+              hx-swap="outerHTML"
+              hx-indicator="#tools-loading"
+              hx-trigger="change"
             />
             <label
               for="show-inactive-tools"
@@ -2918,7 +3247,7 @@
                 <input
                   type="text"
                   id="tools-search-input"
-                  placeholder="Search tools via tags..."
+                  placeholder="Search tools..."
                   class="w-80 px-3 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-300 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
                 />
               </div>
@@ -2938,18 +3267,11 @@
           <div class="overflow-x-auto">
             <!-- Table will be loaded via HTMX -->
             <div id="tools-table"
-                 hx-get="{{ root_path }}/admin/tools/partial?page=1&per_page=20&include_inactive={{ include_inactive|default(false)|string|lower }}{% if selected_team_id %}&team_id={{ selected_team_id }}{% endif %}"
+                 x-init="$el.setAttribute('hx-get', buildTableUrl('tools', '{{ root_path }}/admin/tools/partial', {include_inactive: (document.getElementById('show-inactive-tools')?.checked ?? false).toString(){% if selected_team_id %}, team_id: '{{ selected_team_id }}'{% endif %}}))"
                  hx-trigger="load"
                  hx-swap="outerHTML"
                  hx-indicator="#tools-loading">
-              <!-- Loading placeholder -->
-              <div class="flex items-center justify-center p-8">
-                <svg class="animate-spin h-8 w-8 text-indigo-600 dark:text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-                <span class="ml-3 text-gray-600 dark:text-gray-400">Loading tools...</span>
-              </div>
+
             </div>
           </div>
 
@@ -3000,8 +3322,8 @@
             {% set base_url = root_path + '/admin/tools/partial' %}
             {% set hx_target = '#tools-table' %}
             {% set hx_indicator = '#tools-loading' %}
+            {% set table_name = 'tools' %}
             {% set query_params = {'include_inactive': include_inactive} %}
-
             {% include 'pagination_controls.html' %}
           </div>
         </div>
@@ -3500,6 +3822,7 @@
                   <input
                     type="text"
                     name="auth_username"
+                    autocomplete="off"
                     class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                   />
                 </div>
@@ -3510,6 +3833,7 @@
                   <input
                     type="password"
                     name="auth_password"
+                    autocomplete="off"
                     class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                   />
                 </div>
@@ -3522,6 +3846,7 @@
                   <input
                     type="password"
                     name="auth_token"
+                    autocomplete="off"
                     class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                   />
                 </div>
@@ -3648,7 +3973,7 @@
         </div>
       </div>
       {% if toolops_enabled %}
-      <div id="tool-ops-panel" class="tab-panel">
+      <div id="tool-ops-panel" class="tab-panel hidden">
         <div class="flex justify-between items-center mb-4">
           <div>
             <h2 class="text-2xl font-bold dark:text-gray-200">Tool Operations</h2>
@@ -3661,6 +3986,7 @@
           <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
             <!-- Left Column -->
             <div class="lg:col-span-2 bg-white border border-gray-200 rounded-lg shadow-sm">
+              <!-- Search box and checkbox controls, which are static and not part of the HTMX swap -->
               <div class="p-4 flex items-center justify-between border-b border-gray-200">
                 <input
                   type="text"
@@ -3672,8 +3998,14 @@
                   <input
                     type="checkbox"
                     id="show-inactive-tools-toolops"
-                    class="mr-2"
-                    onchange="toggleInactiveItems('tools-toolops')"
+                    name="include_inactive"
+                    class="mr-2 show-inactive-toggle"
+                    hx-get="{{ root_path }}/admin/tool-ops/partial?page=1"
+                    hx-vals="js:{include_inactive: document.getElementById('show-inactive-tools-toolops').checked}"
+                    hx-trigger="change"
+                    hx-target="#tool-ops-main-content-wrapper"
+                    hx-swap="innerHTML"
+                    hx-indicator="#tool-ops-loading-indicator"
                   />
                   <label
                     for="show-inactive-tools-toolops"
@@ -3683,25 +4015,21 @@
                 </div>
               </div>
 
-              <div class="overflow-x-auto">
-                <table class="min-w-full divide-y divide-gray-200 text-sm" id="toolTable">
-                  <thead class="bg-gray-50">
-                    <tr>
-                      <th class="px-4 py-3"></th>
-                      <th class="px-4 py-3 text-left font-medium text-gray-600">Name</th>
-                      <th class="px-4 py-3 text-left font-medium text-gray-600">Type</th>
-                      <th class="px-4 py-3 text-left font-medium text-gray-600">Status</th>
-                      <th class="px-4 py-3 text-left font-medium text-gray-600">Action</th>
-                    </tr>
-                  </thead>
-                  <tbody class="bg-white divide-y divide-gray-200" id="toolBody">
-                    <tr>
-                      <td colspan="5" class="text-center py-4 text-gray-500">Loading tools...</td>
-                    </tr>
-                  </tbody>
-                </table>
+              <!-- This div will be the target for the HTMX initial load and subsequent swaps -->
+              <div id="tool-ops-main-content-wrapper" hx-get="{{ root_path }}/admin/tool-ops/partial" hx-trigger="load" hx-swap="innerHTML" hx-indicator="#tool-ops-loading-indicator">
+
               </div>
 
+              <!-- Loading Indicator for HTMX -->
+              <div id="tool-ops-loading-indicator" class="htmx-indicator">
+                <div class="flex items-center justify-center p-4">
+                  <svg class="animate-spin h-8 w-8 text-indigo-600 dark:text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                  <span class="ml-2 text-gray-600 dark:text-gray-400">Loading tools...</span>
+                </div>
+              </div>
 
             </div>
 
@@ -3889,6 +4217,8 @@
         </div>
       </div>
 
+      {% endif %}
+      {% if 'resources' not in hidden_sections %}
       <!-- Resources Panel -->
       <div id="resources-panel" class="tab-panel hidden">
         <div class="flex justify-between items-center mb-4">
@@ -3902,8 +4232,16 @@
             <input
               type="checkbox"
               id="show-inactive-resources"
-              class="mr-2"
-              onchange="toggleInactiveItems('resources')"
+              class="mr-2 show-inactive-toggle"
+              name="include_inactive"
+              x-init="syncCheckboxFromUrl('resources', 'show-inactive-resources')"
+              @change="updateInactiveUrlState('resources', $el.checked)"
+              hx-get="{{ root_path }}/admin/resources/partial?page=1{% if selected_team_id %}&team_id={{ selected_team_id }}{% endif %}"
+              hx-vals="js:{include_inactive: document.getElementById('show-inactive-resources').checked, per_page: document.querySelector('#resources-pagination-controls select')?.value || 50, q: document.getElementById('resources-search-input')?.value || '', tags: document.getElementById('resources-tag-filter')?.value || ''}"
+              hx-target="#resources-table"
+              hx-swap="outerHTML"
+              hx-indicator="#resources-loading"
+              hx-trigger="change"
             />
             <label
               for="show-inactive-resources"
@@ -3922,7 +4260,7 @@
                 <input
                   type="text"
                   id="resources-search-input"
-                  placeholder="Search resources via tags..."
+                  placeholder="Search resources..."
                   class="w-80 px-3 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-300 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
                 />
               </div>
@@ -3942,18 +4280,26 @@
           <div class="overflow-x-auto">
             <!-- HTMX container: will be replaced by /admin/resources/partial -->
             <div id="resources-list-container"
-              hx-get="{{ root_path }}/admin/resources/partial?page=1&per_page=20&include_inactive={{ include_inactive|default(false)|string|lower }}{% if selected_team_id %}&team_id={{ selected_team_id }}{% endif %}"
+              x-init="$el.setAttribute('hx-get', buildTableUrl('resources', '{{ root_path }}/admin/resources/partial', {include_inactive: (document.getElementById('show-inactive-resources')?.checked ?? false).toString(){% if selected_team_id %}, team_id: '{{ selected_team_id }}'{% endif %}}))"
               hx-trigger="load"
               hx-swap="outerHTML"
               hx-indicator="#resources-loading"
             >
               <!-- initial content will be swapped out by HTMX on load -->
             </div>
-            <!-- Loading indicator for resources HTMX requests -->
-            <div id="resources-loading" style="display:none">
-              <div class="spinner"></div>
+          </div>
+
+          <!-- Loading Indicator for HTMX -->
+          <div id="resources-loading" class="htmx-indicator">
+            <div class="flex items-center justify-center p-4">
+              <svg class="animate-spin h-8 w-8 text-indigo-600 dark:text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+              <span class="ml-2 text-gray-600 dark:text-gray-400">Loading resources...</span>
             </div>
           </div>
+
           <!-- Placeholder for out-of-band pagination controls (injected by partial) -->
           <div id="resources-pagination-controls"></div>
         </div>
@@ -4112,6 +4458,8 @@
         </div>
       </div>
 
+      {% endif %}
+      {% if 'prompts' not in hidden_sections %}
       <!-- Prompts Panel -->
       <div id="prompts-panel" class="tab-panel hidden">
         <div class="flex justify-between items-center mb-4">
@@ -4125,8 +4473,16 @@
             <input
               type="checkbox"
               id="show-inactive-prompts"
-              class="mr-2"
-              onchange="toggleInactiveItems('prompts')"
+              class="mr-2 show-inactive-toggle"
+              name="include_inactive"
+              x-init="syncCheckboxFromUrl('prompts', 'show-inactive-prompts')"
+              @change="updateInactiveUrlState('prompts', $el.checked)"
+              hx-get="{{ root_path }}/admin/prompts/partial?page=1{% if selected_team_id %}&team_id={{ selected_team_id }}{% endif %}"
+              hx-vals="js:{include_inactive: document.getElementById('show-inactive-prompts').checked, per_page: document.querySelector('#prompts-pagination-controls select')?.value || 50, q: document.getElementById('prompts-search-input')?.value || '', tags: document.getElementById('prompts-tag-filter')?.value || ''}"
+              hx-target="#prompts-table"
+              hx-swap="outerHTML"
+              hx-indicator="#prompts-loading"
+              hx-trigger="change"
             />
             <label
               for="show-inactive-prompts"
@@ -4145,7 +4501,7 @@
                 <input
                   type="text"
                   id="prompts-search-input"
-                  placeholder="Search prompts via tags..."
+                  placeholder="Search prompts..."
                   class="w-80 px-3 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-300 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
                 />
               </div>
@@ -4165,32 +4521,24 @@
           <div class="overflow-x-auto">
             <!-- HTMX container: will be replaced by /admin/prompts/partial -->
             <div id="prompts-list-container"
-              hx-get="{{ root_path }}/admin/prompts/partial?page=1&per_page=20&include_inactive={{ include_inactive|default(false)|string|lower }}{% if selected_team_id %}&team_id={{ selected_team_id }}{% endif %}"
+              x-init="$el.setAttribute('hx-get', buildTableUrl('prompts', '{{ root_path }}/admin/prompts/partial', {include_inactive: (document.getElementById('show-inactive-prompts')?.checked ?? false).toString(){% if selected_team_id %}, team_id: '{{ selected_team_id }}'{% endif %}}))"
               hx-trigger="load, refreshUsers"
               hx-swap="outerHTML"
               hx-indicator="#prompts-loading"
             >
-              <!-- initial content will be swapped out by HTMX on load -->
-              <div class="text-center py-4 text-gray-500 dark:text-gray-400">
-                <svg class="animate-spin h-5 w-5 text-purple-600 dark:text-purple-400 inline-block" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-                <span class="ml-2">Loading prompts...</span>
-              </div>
-            </div>
 
-            <!-- Loading Indicator for HTMX (Prompts) -->
-            <div id="prompts-loading" class="htmx-indicator" style="display:none">
-              <div class="flex items-center justify-center p-4">
-                <svg class="animate-spin h-8 w-8 text-purple-600 dark:text-purple-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-                <span class="ml-2 text-gray-600 dark:text-gray-400">Loading prompts...</span>
-              </div>
             </div>
+          </div>
 
+          <!-- Loading Indicator for HTMX -->
+          <div id="prompts-loading" class="htmx-indicator">
+            <div class="flex items-center justify-center p-4">
+              <svg class="animate-spin h-8 w-8 text-indigo-600 dark:text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+              <span class="ml-2 text-gray-600 dark:text-gray-400">Loading prompts...</span>
+            </div>
           </div>
 
           <!-- Placeholder for out-of-band pagination controls (injected by partial) -->
@@ -4377,7 +4725,9 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
         </div>
       </div>
 
+      {% endif %}
       <!-- Overview Panel -->
+      {% if 'overview' not in hidden_sections %}
       <div id="overview-panel" class="tab-panel"
            hx-get="{{ root_path }}/admin/overview/partial"
            hx-trigger="load"
@@ -4392,7 +4742,9 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
           </div>
         </div>
       </div>
+      {% endif %}
 
+      {% if 'gateways' not in hidden_sections %}
       <!-- Gateways Panel -->
       <div id="gateways-panel" class="tab-panel hidden">
         <div class="flex justify-between items-center mb-4">
@@ -4407,8 +4759,16 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
             <input
               type="checkbox"
               id="show-inactive-gateways"
-              class="mr-2"
-              onchange="toggleInactiveItems('gateways')"
+              class="mr-2 show-inactive-toggle"
+              name="include_inactive"
+              x-init="syncCheckboxFromUrl('gateways', 'show-inactive-gateways')"
+              @change="updateInactiveUrlState('gateways', $el.checked)"
+              hx-get="{{ root_path }}/admin/gateways/partial?page=1{% if selected_team_id %}&team_id={{ selected_team_id }}{% endif %}"
+              hx-vals="js:{include_inactive: document.getElementById('show-inactive-gateways').checked, per_page: document.querySelector('#gateways-pagination-controls select')?.value || 50, q: document.getElementById('gateways-search-input')?.value || '', tags: document.getElementById('gateways-tag-filter')?.value || ''}"
+              hx-target="#gateways-table"
+              hx-swap="outerHTML"
+              hx-indicator="#gateways-loading"
+              hx-trigger="change"
             />
             <label
               for="show-inactive-gateways"
@@ -4427,7 +4787,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                 <input
                   type="text"
                   id="gateways-search-input"
-                  placeholder="Search MCP servers..."
+                  placeholder="Search gateways..."
                   class="w-64 px-3 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-300 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
                 />
               </div>
@@ -4448,18 +4808,11 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
           <div class="overflow-x-auto">
             <!-- Table will be loaded via HTMX -->
             <div id="gateways-table"
-                 hx-get="{{ root_path }}/admin/gateways/partial?page=1&per_page=20&include_inactive={{ include_inactive|default(false)|string|lower }}{% if selected_team_id %}&team_id={{ selected_team_id }}{% endif %}"
+                 x-init="$el.setAttribute('hx-get', buildTableUrl('gateways', '{{ root_path }}/admin/gateways/partial', {include_inactive: (document.getElementById('show-inactive-gateways')?.checked ?? false).toString(){% if selected_team_id %}, team_id: '{{ selected_team_id }}'{% endif %}}))"
                  hx-trigger="load"
                  hx-swap="outerHTML"
                  hx-indicator="#gateways-loading">
-              <!-- Loading placeholder -->
-              <div class="flex items-center justify-center p-8">
-                <svg class="animate-spin h-8 w-8 text-indigo-600 dark:text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-                <span class="ml-3 text-gray-600 dark:text-gray-400">Loading gateways...</span>
-              </div>
+
             </div>
           </div>
 
@@ -4510,8 +4863,8 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
             {% set base_url = root_path + '/admin/gateways/partial' %}
             {% set hx_target = '#gateways-table' %}
             {% set hx_indicator = '#gateways-loading' %}
+            {% set table_name = 'gateways' %}
             {% set query_params = {'include_inactive': include_inactive} %}
-
             {% include 'pagination_controls.html' %}
           </div>
         </div>
@@ -4596,7 +4949,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                     {% if gateway.tags %} {% for tag in gateway.tags %}
                     <span
                       class="inline-block bg-blue-100 text-blue-800 text-xs px-2 py-1 rounded-full mr-1 mb-1"
-                      >{{ tag.id }}</span
+                      >{% if tag is mapping %}{{ tag.id }}{% else %}{{ tag }}{% endif %}</span
                     >
                     {% endfor %} {% else %}
                     <span class="text-gray-400">No tags</span>
@@ -4681,8 +5034,8 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                   </td>
                   <td class="px-2 py-4 whitespace-nowrap">
                     {% if gateway.team %}
-                    <span class="text-sm text-gray-900 dark:text-gray-100">
-                      {{ gateway.team.replace(' ', '<br />')|safe }}
+                    <span class="text-sm text-gray-900 dark:text-gray-100" style="display: block; white-space: normal; word-spacing: 9999px;">
+                      {{ gateway.team }}
                     </span>
                     {% else %}
                     <span class="text-gray-500 dark:text-gray-300 text-xs"
@@ -4779,7 +5132,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                         {% if gateway.enabled %}
                         <form
                           method="POST"
-                          action="{{ root_path }}/admin/gateways/{{ gateway.id }}/toggle"
+                          action="{{ root_path }}/admin/gateways/{{ gateway.id }}/state"
                           class="contents"
                           onsubmit="return handleToggleSubmit(event, 'gateways')"
                         >
@@ -4795,7 +5148,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                         {% else %}
                         <form
                           method="POST"
-                          action="{{ root_path }}/admin/gateways/{{ gateway.id }}/toggle"
+                          action="{{ root_path }}/admin/gateways/{{ gateway.id }}/state"
                           class="contents"
                           onsubmit="return handleToggleSubmit(event, 'gateways')"
                         >
@@ -4914,10 +5267,11 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                       name="visibility"
                       value="public"
                       class="form-radio h-5 w-5 text-indigo-600 dark:bg-gray-800 dark:border-gray-600"
+                      id="gateway-visibility-public"
                       checked
                     />
                     <label
-                      for="edit-visibility-public"
+                      for="gateway-visibility-public"
                       class="ml-2 text-sm text-gray-700 dark:text-gray-400"
                       >🌍Public</label
                     >
@@ -4927,10 +5281,11 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                       type="radio"
                       name="visibility"
                       value="team"
+                      id="gateway-visibility-team"
                       class="form-radio h-5 w-5 text-indigo-600 dark:bg-gray-800 dark:border-gray-600"
                     />
                     <label
-                      for="edit-visibility-team"
+                      for="gateway-visibility-team"
                       class="ml-2 text-sm text-gray-700 dark:text-gray-400"
                       >👥Team</label
                     >
@@ -4940,10 +5295,11 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                       type="radio"
                       name="visibility"
                       value="private"
+                      id="gateway-visibility-private"
                       class="form-radio h-5 w-5 text-indigo-600 dark:bg-gray-800 dark:border-gray-600"
                     />
                     <label
-                      for="edit-visibility-private"
+                      for="gateway-visibility-private"
                       class="ml-2 text-sm text-gray-700 dark:text-gray-400"
                       >🔒Private</label
                     >
@@ -4979,7 +5335,51 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                   <option value="bearer">Bearer Token</option>
                   <option value="authheaders">Custom Headers</option>
                   <option value="oauth">OAuth 2.0</option>
+                  <option value="query_param">Query Parameter (INSECURE)</option>
                 </select>
+              </div>
+              <div id="auth-query_param-fields-gw" style="display: none">
+                <div class="p-3 mb-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-300 dark:border-amber-700 rounded-md">
+                  <p class="text-xs text-amber-700 dark:text-amber-400">
+                    <strong>Security Warning:</strong> API keys in URLs may appear in proxy logs, browser history, and server access logs.
+                    Only use when the upstream server requires this authentication method.
+                  </p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-700 dark:text-gray-300"
+                    >Query Parameter Name</label
+                  >
+                  <input
+                    type="text"
+                    name="auth_query_param_key"
+                    placeholder="e.g., tavilyApiKey"
+                    class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
+                  />
+                </div>
+                <div class="mt-2">
+                  <label class="block text-sm font-medium text-gray-700 dark:text-gray-300"
+                    >API Key Value</label
+                  >
+                  <div class="relative">
+                    <input
+                      type="password"
+                      name="auth_query_param_value"
+                      id="auth-query-param-value-gw"
+                      autocomplete="off"
+                      data-sensitive-label="API key"
+                      class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300 pr-16"
+                    />
+                    <button
+                      type="button"
+                      class="absolute inset-y-0 right-0 flex items-center px-3 text-xs font-medium text-indigo-600 hover:text-indigo-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 dark:text-indigo-300"
+                      onclick="toggleInputMask('auth-query-param-value-gw', this)"
+                      aria-pressed="false"
+                      aria-label="Show API key"
+                    >
+                      Show
+                    </button>
+                  </div>
+                </div>
               </div>
               <div id="auth-basic-fields-gw" style="display: none">
                 <div>
@@ -4989,6 +5389,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                   <input
                     type="text"
                     name="auth_username"
+                    autocomplete="off"
                     class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                   />
                 </div>
@@ -5001,6 +5402,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                       type="password"
                       name="auth_password"
                       id="auth-password-gw"
+                      autocomplete="off"
                       data-sensitive-label="password"
                       class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300 pr-16"
                     />
@@ -5026,6 +5428,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                       type="password"
                       name="auth_token"
                       id="auth-token-gw"
+                      autocomplete="off"
                       data-sensitive-label="token"
                       class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300 pr-16"
                     />
@@ -5150,6 +5553,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                     <input
                       type="password"
                       name="oauth_client_secret"
+                      autocomplete="off"
                       class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                       placeholder="Leave empty for auto-registration via DCR"
                     />
@@ -5168,6 +5572,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                       type="text"
                       name="oauth_username"
                       id="oauth-username-gw"
+                      autocomplete="off"
                       class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                       placeholder="systemadmin@system.com"
                     />
@@ -5186,6 +5591,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                       type="password"
                       name="oauth_password"
                       id="oauth-password-gw"
+                      autocomplete="off"
                       class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                       placeholder="Enter password"
                     />
@@ -5468,8 +5874,9 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
         </div>
       </div>
 
+      {% endif %}
       <!-- Teams Panel -->
-      {% if email_auth_enabled %}
+      {% if email_auth_enabled and 'teams' not in hidden_sections %}
       <div id="teams-panel" class="tab-panel hidden">
           <!-- Header with Create Team Button -->
           <div class="flex justify-between items-center mb-8">
@@ -5512,7 +5919,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                   id="team-search"
                   placeholder="Find teams..."
                   class="block w-full px-1.5 border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white"
-                  oninput="filterTeams(this.value)"
+                  oninput="serverSideTeamSearch(this.value)"
                 />
               </div>
               <div class="flex gap-2">
@@ -5548,22 +5955,35 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
             </div>
           </div>
 
-          <!-- Teams List -->
-          <div id="unified-teams-list" class="space-y-4">
-            <div class="text-center py-8">
-              <div class="animate-pulse text-gray-500 dark:text-gray-400">
-                Loading teams...
-              </div>
-              <div class="text-xs text-gray-400 dark:text-gray-500 mt-2">
-                Note: Team management requires email authentication
-              </div>
+          <!-- Loading indicator -->
+          <div id="teams-loading" class="htmx-indicator">
+            <div class="flex items-center justify-center p-4">
+              <svg class="animate-spin h-8 w-8 text-indigo-600 dark:text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+              <span class="ml-2 text-gray-600 dark:text-gray-400">Loading teams...</span>
             </div>
           </div>
+
+          <!-- Teams List - loaded via initializeTeamManagement() when tab is shown -->
+          <div id="unified-teams-list" class="space-y-4">
+            <div class="flex items-center justify-center p-4">
+              <svg class="animate-spin h-8 w-8 text-indigo-600 dark:text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+              <span class="ml-2 text-gray-600 dark:text-gray-400">Loading teams...</span>
+            </div>
+          </div>
+
+          <!-- Pagination controls placeholder (will be swapped OOB) -->
+          <div id="teams-pagination-controls" class="mt-4"></div>
       </div>
       {% endif %}
 
       <!-- User Management Panel -->
-      {% if email_auth_enabled and is_admin %}
+      {% if email_auth_enabled and is_admin and 'users' not in hidden_sections %}
       <div id="users-panel" class="tab-panel hidden">
         <div class="flex justify-between items-center mb-4">
           <h2 class="text-2xl font-bold dark:text-gray-200">User Management</h2>
@@ -5599,7 +6019,8 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                     type="email"
                     name="email"
                     required
-                    class="mt-1 px-1.5 block w-full border-gray-300 rounded-md shadow-sm bg-gray-300 dark:bg-gray-700 dark:border-gray-600"
+                    autocomplete="off"
+                    class="mt-1 px-1.5 block w-full border-gray-300 rounded-md shadow-sm bg-gray-300 dark:bg-gray-700 dark:border-gray-600 dark:text-gray-300"
                     placeholder="user@example.com"
                   />
                 </div>
@@ -5613,6 +6034,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                     type="text"
                     name="full_name"
                     required
+                    autocomplete="off"
                     class="mt-1 px-1.5 block w-full border-gray-300 rounded-md shadow-sm bg-gray-200 dark:bg-gray-700 dark:border-gray-600 text-gray-700 dark:text-gray-300"
                     placeholder="John Smith"
                   />
@@ -5631,8 +6053,9 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                     name="password"
                     required
                     minlength="8"
+                    autocomplete="new-password"
                     oninput="validateNewUserPassword()"
-                    class="mt-1 px-1.5 block w-full border-gray-300 rounded-md shadow-sm dark:bg-gray-700 dark:border-gray-600"
+                    class="mt-1 px-1.5 block w-full border-gray-300 rounded-md shadow-sm dark:bg-gray-700 dark:border-gray-600 dark:text-gray-300"
                     placeholder="Strong password"
                   />
                   <!-- Password policy guidance (visible below password field) -->
@@ -5773,12 +6196,14 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
             </h3>
 
             <!-- Loading indicator -->
-            <div id="users-loading" class="htmx-indicator flex items-center justify-center p-8">
-              <svg class="animate-spin h-8 w-8 text-indigo-600 dark:text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-              </svg>
-              <span class="ml-3 text-gray-600 dark:text-gray-400">Loading users...</span>
+            <div id="users-loading" class="htmx-indicator">
+              <div class="flex items-center justify-center p-4">
+                <svg class="animate-spin h-8 w-8 text-indigo-600 dark:text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <span class="ml-2 text-gray-600 dark:text-gray-400">Loading users...</span>
+              </div>
             </div>
 
             <!-- Users list container -->
@@ -5800,7 +6225,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
       {% endif %}
 
       <!-- API Tokens Panel -->
-      {% if email_auth_enabled %}
+      {% if email_auth_enabled and 'tokens' not in hidden_sections %}
       <div id="tokens-panel" class="tab-panel hidden">
         <div class="flex justify-between items-center mb-4">
           <h2 class="text-2xl font-bold dark:text-gray-200">
@@ -5809,6 +6234,27 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
           <p class="text-sm text-gray-600 dark:text-gray-400 mt-1">
             Create and manage personal API tokens with scoped access controls
           </p>
+          <div class="flex items-center">
+            <input
+              type="checkbox"
+              id="show-inactive-tokens"
+              class="mr-2 show-inactive-toggle"
+              name="include_inactive"
+              x-init="syncCheckboxFromUrl('tokens', 'show-inactive-tokens')"
+              @change="updateInactiveUrlState('tokens', $el.checked)"
+              hx-get="{{ root_path }}/admin/tokens/partial?page=1{% if selected_team_id %}&team_id={{ selected_team_id }}{% endif %}"
+              hx-vals="js:{include_inactive: document.getElementById('show-inactive-tokens').checked, per_page: document.querySelector('#tokens-pagination-controls select')?.value || 50}"
+              hx-target="#tokens-table"
+              hx-swap="innerHTML"
+              hx-indicator="#tokens-loading"
+              hx-trigger="change"
+            />
+            <label
+              for="show-inactive-tokens"
+              class="text-sm font-medium text-gray-700 dark:text-gray-300"
+              >Show Inactive</label
+            >
+          </div>
         </div>
 
         <!-- Create Token Form -->
@@ -5841,6 +6287,9 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                   class="block text-sm font-medium text-gray-700 dark:text-gray-300"
                 >
                   Expires In (Days)
+                  {% if require_token_expiration %}
+                  <span class="text-red-500">*</span>
+                  {% endif %}
                 </label>
                 <input
                   type="number"
@@ -5848,9 +6297,23 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                   min="1"
                   max="365"
                   value="30"
+                  {% if require_token_expiration %}required{% endif %}
+                  {% if require_token_expiration %}
+                  oninvalid="this.setCustomValidity('Expiration is required by server policy. Please enter the number of days (e.g., 30, 90, 365).')"
+                  oninput="this.setCustomValidity('')"
+                  {% endif %}
                   class="mt-1 px-1.5 block w-full border border-gray-300 rounded-md shadow-sm bg-gray-100 dark:bg-gray-700 dark:border-gray-600 text-gray-700 dark:text-gray-300"
                   placeholder="30"
                 />
+                {% if require_token_expiration %}
+                <p class="mt-1 text-xs text-red-600 dark:text-red-400 font-medium">
+                  Token expiration is required by server policy (REQUIRE_TOKEN_EXPIRATION=true).
+                </p>
+                {% else %}
+                <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                  Leave empty for tokens that never expire
+                </p>
+                {% endif %}
               </div>
             </div>
             <div>
@@ -5995,8 +6458,95 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
             <h3 class="text-lg font-medium text-gray-900 dark:text-white mb-4">
               Your API Tokens
             </h3>
-            <div id="tokens-list">
-              <p class="text-gray-500 dark:text-gray-400">Loading tokens...</p>
+
+            <!-- Search Bar -->
+            <div class="flex items-center space-x-2 mb-4">
+              <div class="relative">
+                <input
+                  type="text"
+                  id="tokens-search-input"
+                  placeholder="Search tokens by name..."
+                  class="w-80 px-3 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-300 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
+                />
+              </div>
+              <button
+                id="tokens-clear-search"
+                onclick="clearSearch('tokens')"
+                class="px-2 py-1.5 text-sm text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200 transition-colors">
+                Clear
+              </button>
+            </div>
+
+            <!-- Tokens table loaded via HTMX -->
+            <div id="tokens-table"
+                 x-init="$el.setAttribute('hx-get', buildTableUrl('tokens', '{{ root_path }}/admin/tokens/partial', {include_inactive: (document.getElementById('show-inactive-tokens')?.checked ?? false).toString(){% if selected_team_id %}, team_id: '{{ selected_team_id }}'{% endif %}}))"
+                 hx-trigger="load, refreshTokens"
+                 hx-swap="innerHTML"
+                 hx-indicator="#tokens-loading">
+              <!-- Loading placeholder -->
+              <div class="flex items-center justify-center p-4">
+                <svg class="animate-spin h-8 w-8 text-indigo-600 dark:text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <span class="ml-2 text-gray-600 dark:text-gray-400">Loading tokens...</span>
+              </div>
+            </div>
+
+            <!-- Loading Indicator for HTMX -->
+            <div id="tokens-loading" class="htmx-indicator">
+              <div class="flex items-center justify-center p-4">
+                <svg class="animate-spin h-8 w-8 text-indigo-600 dark:text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <span class="ml-2 text-gray-600 dark:text-gray-400">Loading tokens...</span>
+              </div>
+            </div>
+
+            <!-- Pagination Controls -->
+            {# ---- compute safe pagination values ---- #}
+            {% set page = (pagination.page if pagination is defined else (page if page is defined else 1)) %}
+            {% set per_page = (pagination.per_page if pagination is defined else (per_page if per_page is defined else 50)) %}
+            {% set total_items = (pagination.total_items if pagination is defined else (total_items if total_items is defined else 0)) %}
+            {% set total_pages = (pagination.total_pages if pagination is defined else ((total_items + per_page - 1) // per_page)) %}
+            {% set has_prev = page > 1 %}
+            {% set has_next = (page * per_page) < total_items %}
+
+            {% set pagination = {
+              'page': page,
+              'per_page': per_page,
+              'total_items': total_items,
+              'total_pages': total_pages,
+              'has_prev': has_prev,
+              'has_next': has_next
+            } %}
+
+            {# build the refresh URL for controls #}
+            {% set controls_url = root_path + '/admin/tokens/partial'
+              + '?render=controls'
+              + '&page=' + page|string
+              + '&per_page=' + per_page|string
+              + '&include_inactive=' + (include_inactive|default(false)|string|lower)
+              + ('&team_id=' + selected_team_id if selected_team_id else '')
+              + ('&q=' + q if q else '') %}
+
+            <div id="tokens-pagination-controls"
+                hx-get="{{ controls_url }}"
+                hx-trigger="refreshControls"
+                hx-target="#tokens-pagination-controls"
+                hx-swap="outerHTML"
+                hx-indicator="#tokens-loading">
+
+              {# helpers used by pagination_controls.html #}
+              {% set base_url = root_path + '/admin/tokens/partial' %}
+              {% set hx_target = '#tokens-table' %}
+              {% set hx_indicator = '#tokens-loading' %}
+              {% set table_name = 'tokens' %}
+              {% set query_params = {'include_inactive': include_inactive} %}
+              {% if selected_team_id %}{% set _ = query_params.update({'team_id': selected_team_id}) %}{% endif %}
+              {% if q %}{% set _ = query_params.update({'q': q}) %}{% endif %}
+              {% include 'pagination_controls.html' %}
             </div>
           </div>
         </div>
@@ -6004,7 +6554,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
       {% endif %}
 
       <!-- A2A Agents Panel -->
-      {% if a2a_enabled %}
+      {% if a2a_enabled and 'agents' not in hidden_sections %}
        <div id="a2a-agents-panel" class="tab-panel hidden">
         <div class="flex justify-between items-center mb-4">
           <h2 class="text-2xl font-bold dark:text-gray-200">
@@ -6018,8 +6568,16 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
             <input
               type="checkbox"
               id="show-inactive-a2a-agents"
-              class="mr-2"
-              onchange="toggleInactiveItems('a2a-agents')"
+              class="mr-2 show-inactive-toggle"
+              name="include_inactive"
+              x-init="syncCheckboxFromUrl('agents', 'show-inactive-a2a-agents')"
+              @change="updateInactiveUrlState('agents', $el.checked)"
+              hx-get="{{ root_path }}/admin/a2a/partial?page=1{% if selected_team_id %}&team_id={{ selected_team_id }}{% endif %}"
+              hx-vals="js:{include_inactive: document.getElementById('show-inactive-a2a-agents').checked, per_page: document.querySelector('#agents-pagination-controls select')?.value || 50, q: document.getElementById('a2a-agents-search-input')?.value || '', tags: document.getElementById('a2a-agents-tag-filter')?.value || ''}"
+              hx-target="#agents-table"
+              hx-swap="outerHTML"
+              hx-indicator="#agents-loading"
+              hx-trigger="change"
             />
             <label
               for="show-inactive-a2a-agents"
@@ -6038,7 +6596,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                 <input
                   type="text"
                   id="a2a-agents-search-input"
-                  placeholder="Search agents via tags..."
+                  placeholder="Search agents..."
                   class="w-80 px-3 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-300 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
                 />
               </div>
@@ -6066,7 +6624,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
             <div class="overflow-x-auto">
               <!-- Table will be loaded via HTMX -->
               <div id="agents-table"
-                   hx-get="{{ root_path }}/admin/a2a/partial?page=1&per_page=20&include_inactive={{ include_inactive|default(false)|string|lower }}{% if selected_team_id %}&team_id={{ selected_team_id }}{% endif %}"
+                   x-init="$el.setAttribute('hx-get', buildTableUrl('agents', '{{ root_path }}/admin/a2a/partial', {include_inactive: (document.getElementById('show-inactive-a2a-agents')?.checked ?? false).toString(){% if selected_team_id %}, team_id: '{{ selected_team_id }}'{% endif %}}))"
                    hx-trigger="load"
                    hx-swap="outerHTML"
                    hx-indicator="#agents-loading">
@@ -6128,8 +6686,8 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
               {% set base_url = root_path + '/admin/a2a/partial' %}
               {% set hx_target = '#agents-table' %}
               {% set hx_indicator = '#agents-loading' %}
+              {% set table_name = 'agents' %}
               {% set query_params = {'include_inactive': include_inactive} %}
-
               {% include 'pagination_controls.html' %}
             </div>
           </div>
@@ -6147,6 +6705,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
               <table class="min-w-full divide-y divide-gray-200">
                 <thead class="bg-gray-50 dark:bg-gray-700">
                   <tr>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Actions</th>
                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">ID</th>
                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Name</th>
                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Description</th>
@@ -6158,62 +6717,13 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Owner</th>
                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Team</th>
                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Visibility</th>
-                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Actions</th>
                     </tr>
                 </thead>
                 <tbody class="bg-white divide-y divide-gray-200 dark:bg-gray-900 dark:divide-gray-700">
                   {% if a2a_agents %}
                     {% for agent in a2a_agents %}
                     <tr>
-                      <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-700 dark:text-gray-300">{{ loop.index }}</td>
-                      <td class="px-6 py-4 whitespace-nowrap">
-                        <div class="text-sm font-medium text-gray-900 dark:text-gray-200">{{ agent.name }}</div>
-                      </td>
-                      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">{{ agent.description }}</td>
-                      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">{{ agent.endpointUrl }}</td>
-                      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                        {% if agent.tags %}
-                          {% for tag in agent.tags %}
-                            <span class="inline-flex items-center px-2 py-1 rounded text-xs bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300 mr-1">{{ tag.id }}</span>
-                          {% endfor %}
-                        {% endif %}
-                      </td>
-                      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">{{ agent.agentType }}</td>
-                      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                        <div class="flex flex-col gap-1">
-                          <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium {% if agent.enabled %}bg-green-100 text-green-800{% else %}bg-red-100 text-red-800{% endif %}">{% if agent.enabled %}Active{% else %}Inactive{% endif %}</span>
-                        </div>
-                      </td>
-                      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                        <div class="flex flex-col gap-1">
-                          <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium {% if agent.reachable %}bg-green-100 text-green-800{% else %}bg-yellow-100 text-yellow-800{% endif %}">{% if agent.reachable %}Reachable{% else %}Unreachable{% endif %}</span>
-                        </div>
-                      </td>
-                      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">{{ agent.ownerEmail }}</td>
-                      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">{{ agent.team }}</td>
-                      <td class="px-6 py-4 whitespace-nowrap">
-                    {% if agent.visibility == 'private' %}
-                    <span
-                      class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800"
-                      >Private</span
-                    >
-                    {% elif agent.visibility == 'team' %}
-                    <span
-                      class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800"
-                      >Team</span
-                    >
-                    {% elif agent.visibility == 'public' %}
-                    <span
-                      class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800"
-                      >Public</span
-                    >
-                    {% else %}
-                    <span class="text-gray-500 dark:text-gray-300 text-xs"
-                      >N/A</span
-                    >
-                    {% endif %}
-                  </td>
-                  <td class="px-6 py-4 whitespace-nowrap text-sm font-medium w-32">
+                      <td class="px-6 py-4 whitespace-nowrap text-sm font-medium w-32">
                         <div class="grid grid-cols-2 gap-x-2 gap-y-0 max-w-48">
                           <!-- Row 1: Test (full width) -->
                           <button
@@ -6244,7 +6754,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                           <!-- Row 3: Activate/Deactivate | Delete -->
                           <div class="col-span-2 flex flex-col space-y-1">
                             {% if agent.enabled %}
-                            <form method="POST" action="{{ root_path }}/admin/a2a/{{ agent.id }}/toggle" class="contents">
+                            <form method="POST" action="{{ root_path }}/admin/a2a/{{ agent.id }}/state" class="contents">
                               <input type="hidden" name="activate" value="false" />
                               <button
                                 type="submit"
@@ -6255,7 +6765,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                               </button>
                             </form>
                             {% else %}
-                            <form method="POST" action="{{ root_path }}/admin/a2a/{{ agent.id }}/toggle" class="contents">
+                            <form method="POST" action="{{ root_path }}/admin/a2a/{{ agent.id }}/state" class="contents">
                               <input type="hidden" name="activate" value="true" />
                               <button
                                 type="submit"
@@ -6280,6 +6790,54 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                         </div>
                         <!-- Test result placeholder: updated by admin.js testA2AAgent -->
                         <div id="test-result-{{ agent.id }}" class="hidden test-result mt-2 text-sm" role="status" aria-live="polite"></div>
+                      </td>
+                      <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-700 dark:text-gray-300">{{ loop.index }}</td>
+                      <td class="px-6 py-4 whitespace-nowrap">
+                        <div class="text-sm font-medium text-gray-900 dark:text-gray-200">{{ agent.name }}</div>
+                      </td>
+                      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">{{ agent.description | decode_html }}</td>
+                      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">{{ agent.endpointUrl }}</td>
+                      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                        {% if agent.tags %}
+                          {% for tag in agent.tags %}
+                            <span class="inline-flex items-center px-2 py-1 rounded text-xs bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300 mr-1">{% if tag is mapping %}{{ tag.id }}{% else %}{{ tag }}{% endif %}</span>
+                          {% endfor %}
+                        {% endif %}
+                      </td>
+                      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">{{ agent.agentType }}</td>
+                      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                        <div class="flex flex-col gap-1">
+                          <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium {% if agent.enabled %}bg-green-100 text-green-800{% else %}bg-red-100 text-red-800{% endif %}">{% if agent.enabled %}Active{% else %}Inactive{% endif %}</span>
+                        </div>
+                      </td>
+                      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                        <div class="flex flex-col gap-1">
+                          <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium {% if agent.reachable %}bg-green-100 text-green-800{% else %}bg-yellow-100 text-yellow-800{% endif %}">{% if agent.reachable %}Reachable{% else %}Unreachable{% endif %}</span>
+                        </div>
+                      </td>
+                      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">{{ agent.ownerEmail }}</td>
+                      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">{{ agent.team }}</td>
+                      <td class="px-6 py-4 whitespace-nowrap">
+                        {% if agent.visibility == 'private' %}
+                        <span
+                          class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800"
+                          >Private</span
+                        >
+                        {% elif agent.visibility == 'team' %}
+                        <span
+                          class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800"
+                          >Team</span
+                        >
+                        {% elif agent.visibility == 'public' %}
+                        <span
+                          class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800"
+                          >Public</span
+                        >
+                        {% else %}
+                        <span class="text-gray-500 dark:text-gray-300 text-xs"
+                          >N/A</span
+                        >
+                        {% endif %}
                       </td>
                     </tr>
                     {% endfor %}
@@ -6373,6 +6931,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                   <option value="bearer">Bearer Token</option>
                   <option value="authheaders">Custom Headers</option>
                   <option value="oauth">OAuth 2.0</option>
+                  <option value="query_param">Query Parameter (INSECURE)</option>
                 </select>
               </div>
 
@@ -6384,6 +6943,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                   <input
                     type="text"
                     name="auth_username"
+                    autocomplete="off"
                     class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                   />
                 </div>
@@ -6394,6 +6954,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                   <input
                     type="password"
                     name="auth_password"
+                    autocomplete="off"
                     class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                   />
                 </div>
@@ -6407,6 +6968,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                   <input
                     type="password"
                     name="auth_token"
+                    autocomplete="off"
                     class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                   />
                 </div>
@@ -6449,6 +7011,53 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                     name="auth_headers"
                     id="auth-headers-json-a2a"
                   />
+                </div>
+              </div>
+
+              <!-- Query Parameter Auth Fields -->
+              <div id="auth-query_param-fields-a2a" style="display: none">
+                <div class="p-3 mb-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-300 dark:border-amber-700 rounded-md">
+                  <p class="text-xs text-amber-700 dark:text-amber-400">
+                    <strong>Security Warning:</strong> API keys in URLs may appear in proxy logs, browser history, and server access logs.
+                    Consider using bearer tokens or headers instead (CWE-598).
+                  </p>
+                </div>
+                <div>
+                  <label
+                    class="block text-sm font-medium text-gray-700 dark:text-gray-300"
+                  >
+                    Query Parameter Name
+                  </label>
+                  <input
+                    type="text"
+                    name="auth_query_param_key"
+                    placeholder="e.g., api_key"
+                    class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
+                  />
+                </div>
+                <div class="mt-3">
+                  <label
+                    class="block text-sm font-medium text-gray-700 dark:text-gray-300"
+                  >
+                    Query Parameter Value
+                  </label>
+                  <div class="relative">
+                    <input
+                      type="password"
+                      name="auth_query_param_value"
+                      id="auth-query-param-value-a2a"
+                      autocomplete="off"
+                      data-sensitive-label="API key"
+                      class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300 pr-16"
+                    />
+                    <button
+                      type="button"
+                      onclick="toggleInputMask('auth-query-param-value-a2a', this)"
+                      class="absolute inset-y-0 right-0 mt-1 px-3 flex items-center text-sm text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+                    >
+                      Show
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -6521,6 +7130,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                     <input
                       type="password"
                       name="oauth_client_secret"
+                      autocomplete="off"
                       class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                       placeholder="Leave empty for auto-registration via DCR"
                     />
@@ -6539,6 +7149,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                       type="text"
                       name="oauth_username"
                       id="oauth-username-a2a"
+                      autocomplete="off"
                       class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                       placeholder="systemadmin@system.com"
                     />
@@ -6557,6 +7168,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                       type="password"
                       name="oauth_password"
                       id="oauth-password-a2a"
+                      autocomplete="off"
                       class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                       placeholder="Enter password"
                     />
@@ -6744,6 +7356,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                   id="a2a-agent-auth-value"
                   name="auth_value"
                   placeholder="API key, token, etc."
+                  autocomplete="off"
                   class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                 />
               </div>
@@ -6886,7 +7499,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
       {% endif %}
 
       <!-- gRPC Services Panel -->
-      {% if grpc_enabled %}
+      {% if grpc_enabled and 'agents' not in hidden_sections %}
       <div id="grpc-services-panel" class="tab-panel hidden">
         <div class="flex justify-between items-center mb-4">
           <h2 class="text-2xl font-bold dark:text-gray-200">
@@ -6902,7 +7515,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
           <h3 class="text-lg font-medium text-gray-900 dark:text-gray-200 mb-4">
             Register New gRPC Service
           </h3>
-          <form action="{{ root_path }}/grpc" method="POST" id="add-grpc-service-form">
+          <form method="POST" id="add-grpc-service-form">
             <div class="grid grid-cols-1 gap-7 sm:grid-cols-2">
               <!-- Service Name -->
               <div class="relative">
@@ -7039,6 +7652,25 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                 </select>
               </div>
               {% endif %}
+
+              <!-- Visibility -->
+              <div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-400 mb-2">Visibility</label>
+                <div class="flex items-center space-x-4">
+                  <div class="flex items-center">
+                    <input type="radio" name="visibility" value="public" class="form-radio h-5 w-5 text-indigo-600 dark:bg-gray-800 dark:border-gray-600" id="grpc-visibility-public" checked />
+                    <label for="grpc-visibility-public" class="ml-2 text-sm text-gray-700 dark:text-gray-400">Public</label>
+                  </div>
+                  <div class="flex items-center">
+                    <input type="radio" name="visibility" value="team" class="form-radio h-5 w-5 text-indigo-600 dark:bg-gray-800 dark:border-gray-600" id="grpc-visibility-team" />
+                    <label for="grpc-visibility-team" class="ml-2 text-sm text-gray-700 dark:text-gray-400">Team</label>
+                  </div>
+                  <div class="flex items-center">
+                    <input type="radio" name="visibility" value="private" class="form-radio h-5 w-5 text-indigo-600 dark:bg-gray-800 dark:border-gray-600" id="grpc-visibility-private" />
+                    <label for="grpc-visibility-private" class="ml-2 text-sm text-gray-700 dark:text-gray-400">Private</label>
+                  </div>
+                </div>
+              </div>
             </div>
 
             <div class="mt-6">
@@ -7049,7 +7681,16 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                 Register gRPC Service
               </button>
             </div>
+            <!-- Loading Indicator -->
+            <div
+              id="add-grpc-loading"
+              class="hidden text-sm text-gray-500 mt-2"
+            >
+              Submitting...
+            </div>
           </form>
+          <!-- Error Message Display -->
+          <div id="grpcFormError" class="mt-4 text-red-600 dark:text-red-400 hidden"></div>
         </div>
 
         <!-- Registered gRPC Services List -->
@@ -7067,7 +7708,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                       {{ service.name }}
                     </h4>
                     <p class="text-sm text-gray-600 dark:text-gray-400">
-                      {{ service.description or "" }}
+                      {{ (service.description or "") | decode_html }}
                     </p>
                     <div class="mt-2 flex flex-wrap gap-2">
                       <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium {% if service.enabled %}bg-green-100 text-green-800{% else %}bg-red-100 text-red-800{% endif %}">
@@ -7096,7 +7737,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                     </div>
                   </div>
                   <div class="flex flex-col space-y-2 ml-4">
-                    <form action="{{ root_path }}/grpc/{{ service.id }}/toggle" method="POST" class="inline">
+                    <form action="{{ root_path }}/admin/grpc/{{ service.id }}/state?activate={{ 'false' if service.enabled else 'true' }}" method="POST" class="inline">
                       <button
                         type="submit"
                         class="px-3 py-1 text-sm font-medium rounded-md {% if service.enabled %}bg-yellow-100 text-yellow-800 hover:bg-yellow-200{% else %}bg-green-100 text-green-800 hover:bg-green-200{% endif %}"
@@ -7104,7 +7745,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                         {% if service.enabled %}Deactivate{% else %}Activate{% endif %}
                       </button>
                     </form>
-                    <form action="{{ root_path }}/grpc/{{ service.id }}/reflect" method="POST" class="inline">
+                    <form action="{{ root_path }}/admin/grpc/{{ service.id }}/reflect" method="POST" class="inline">
                       <button
                         type="submit"
                         class="px-3 py-1 text-sm font-medium bg-blue-100 text-blue-800 rounded-md hover:bg-blue-200"
@@ -7118,7 +7759,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                     >
                       View Methods
                     </button>
-                    <form action="{{ root_path }}/grpc/{{ service.id }}/delete" method="POST" class="inline" onsubmit="return confirm('Are you sure you want to delete this gRPC service?')">
+                    <form action="{{ root_path }}/admin/grpc/{{ service.id }}/delete" method="POST" class="inline" onsubmit="return confirm('Are you sure you want to delete this gRPC service?')">
                       <button
                         type="submit"
                         class="px-3 py-1 text-sm font-medium bg-red-100 text-red-800 rounded-md hover:bg-red-200"
@@ -7138,6 +7779,7 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
       </div>
       {% endif %}
 
+      {% if 'roots' not in hidden_sections %}
       <!-- Roots Panel -->
       <div id="roots-panel" class="tab-panel hidden">
         <!-- List of roots ------------------------------------------------------->
@@ -7147,20 +7789,6 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
             <h2 class="text-2xl font-bold dark:text-gray-200">
               Root Directories
             </h2>
-            <div class="flex items-center">
-              <input
-                type="checkbox"
-                id="show-inactive-roots"
-                class="mr-2"
-                onchange="toggleInactiveItems('roots')"
-              />
-              <label
-                for="show-inactive-roots"
-                class="text-sm font-medium text-gray-700 dark:text-gray-300"
-              >
-                Show Inactive
-              </label>
-            </div>
           </div>
 
           <!-- Description -->
@@ -7222,34 +7850,25 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
                       <button
                         onclick="viewRoot('{{ root.uri }}')"
                         class="flex items-center justify-center px-2 py-1 text-xs font-medium rounded-md text-indigo-600 hover:text-indigo-900 hover:bg-indigo-50 dark:text-indigo-400 dark:hover:bg-indigo-900/20 transition-colors"
-                        x-tooltip="'💡View virtual server details and configuration'"
+                        x-tooltip="'💡View root directory details and configuration'"
                       >
                         View
                       </button>
                       <button
                         onclick="editRoot('{{ root.uri }}')"
                         class="flex items-center justify-center px-2 py-1 text-xs font-medium rounded-md text-green-600 hover:text-green-900 hover:bg-green-50 dark:text-green-400 dark:hover:bg-green-900/20 transition-colors"
-                        x-tooltip="'💡Edit virtual server settings and configuration'"
+                        x-tooltip="'💡Edit root directory settings and configuration'"
                       >
                         Edit
                       </button>
 
-                      <!-- Row 2: Export -->
+                      <!-- Row 2: Export | Delete -->
                       <button
                         onclick="exportRoot('{{ root.uri }}')"
-                        class="col-span-2 flex items-center justify-center px-2 py-1 text-xs font-medium rounded-md text-purple-600 hover:text-purple-900 hover:bg-purple-50 dark:text-purple-400 dark:hover:bg-purple-900/20 transition-colors"
-                        x-tooltip="'💡Export virtual server configuration'"
+                        class="flex items-center justify-center px-2 py-1 text-xs font-medium rounded-md text-purple-600 hover:text-purple-900 hover:bg-purple-50 dark:text-purple-400 dark:hover:bg-purple-900/20 transition-colors"
+                        x-tooltip="'💡Export root directory configuration'"
                       >
                         Export
-                      </button>
-
-                      <!-- Row 3: Deactivate | Delete -->
-                      <button
-                        onclick="deactivateRoot('{{ root.uri }}')"
-                        class="flex items-center justify-center px-2 py-1 text-xs font-medium rounded-md text-yellow-600 hover:text-yellow-900 hover:bg-yellow-50 dark:text-yellow-400 dark:hover:bg-yellow-900/20 transition-colors"
-                        x-tooltip="'💡Temporarily disable this virtual server (can be re-activated)'"
-                      >
-                        Deactivate
                       </button>
                       <form
                         method="POST"
@@ -7324,8 +7943,9 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
           </form>
         </div>
       </div>
+      {% endif %}
 
-      {% if is_admin %}
+      {% if is_admin and 'metrics' not in hidden_sections %}
       <!-- Metrics Panel -->
       <div id="metrics-panel" class="tab-panel hidden">
         <!-- System Metrics Section (isolated from JavaScript clearing) -->
@@ -8064,6 +8684,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                           type="text"
                           name="auth_username"
                           id="edit-auth-username"
+                          autocomplete="off"
                           class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-600 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                         />
                       </div>
@@ -8076,6 +8697,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                           type="password"
                           name="auth_password"
                           id="edit-auth-password"
+                          autocomplete="off"
                           class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-600 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                           placeholder="********"
                         />
@@ -8091,6 +8713,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                           type="password"
                           name="auth_token"
                           id="edit-auth-token"
+                          autocomplete="off"
                           class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-600 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                           placeholder="********"
                         />
@@ -9223,7 +9846,51 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                         <option value="bearer">Bearer Token</option>
                         <option value="authheaders">Custom Headers</option>
                         <option value="oauth">OAuth 2.0</option>
+                        <option value="query_param">Query Parameter (INSECURE)</option>
                       </select>
+                    </div>
+                    <div id="auth-query_param-fields-gw-edit" style="display: none">
+                      <div class="p-3 mb-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-300 dark:border-amber-700 rounded-md">
+                        <p class="text-xs text-amber-700 dark:text-amber-400">
+                          <strong>Security Warning:</strong> API keys in URLs may appear in proxy logs, browser history, and server access logs.
+                          Only use when the upstream server requires this authentication method.
+                        </p>
+                      </div>
+                      <div>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300"
+                          >Query Parameter Name</label
+                        >
+                        <input
+                          type="text"
+                          name="auth_query_param_key"
+                          placeholder="e.g., tavilyApiKey"
+                          class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
+                        />
+                      </div>
+                      <div class="mt-2">
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300"
+                          >API Key Value</label
+                        >
+                        <div class="relative">
+                          <input
+                            type="password"
+                            name="auth_query_param_value"
+                            id="auth-query-param-value-gw-edit"
+                            autocomplete="off"
+                            data-sensitive-label="API key"
+                            class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300 pr-16"
+                          />
+                          <button
+                            type="button"
+                            class="absolute inset-y-0 right-0 flex items-center px-3 text-xs font-medium text-indigo-600 hover:text-indigo-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 dark:text-indigo-300"
+                            onclick="toggleInputMask('auth-query-param-value-gw-edit', this)"
+                            aria-pressed="false"
+                            aria-label="Show API key"
+                          >
+                            Show
+                          </button>
+                        </div>
+                      </div>
                     </div>
                     <div id="auth-basic-fields-gw-edit" style="display: none">
                       <div>
@@ -9233,6 +9900,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                         <input
                           type="text"
                           name="auth_username"
+                          autocomplete="off"
                           class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                         />
                       </div>
@@ -9245,6 +9913,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                           type="password"
                           name="auth_password"
                           id="auth-password-gw-edit"
+                          autocomplete="off"
                           data-sensitive-label="password"
                           class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300 pr-16"
                         />
@@ -9270,6 +9939,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                           type="password"
                           name="auth_token"
                           id="auth-token-gw-edit"
+                          autocomplete="off"
                           data-sensitive-label="token"
                           class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300 pr-16"
                         />
@@ -9400,6 +10070,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                             type="password"
                             name="oauth_client_secret"
                             id="oauth-client-secret-gw-edit"
+                            autocomplete="off"
                             class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                             placeholder="Leave empty for auto-registration via DCR"
                           />
@@ -9421,6 +10092,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                             type="text"
                             name="oauth_username"
                             id="oauth-username-gw-edit"
+                            autocomplete="off"
                             class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                             placeholder="systemadmin@system.com"
                           />
@@ -9439,6 +10111,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                             type="password"
                             name="oauth_password"
                             id="oauth-password-gw-edit"
+                            autocomplete="off"
                             class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                             placeholder="Enter password"
                           />
@@ -9682,6 +10355,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                           <option value="bearer">Bearer Token</option>
                           <option value="authheaders">Custom Headers</option>
                           <option value="oauth">OAuth 2.0</option>
+                          <option value="query_param">Query Parameter (INSECURE)</option>
                         </select>
                       </div>
 
@@ -9692,6 +10366,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                           <input
                             type="text"
                             name="auth_username"
+                            autocomplete="off"
                             class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm
                                   focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:text-gray-300"
                           />
@@ -9701,6 +10376,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                           <input
                             type="password"
                             name="auth_password"
+                            autocomplete="off"
                             class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm
                                   focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:text-gray-300"
                           />
@@ -9714,6 +10390,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                           <input
                             type="password"
                             name="auth_token"
+                            autocomplete="off"
                             class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm
                                   focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:text-gray-300"
                           />
@@ -9740,6 +10417,54 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                           </div>
                           <div id="auth-headers-container-a2a-edit" class="space-y-2"></div>
                           <input type="hidden" name="auth_headers" id="auth-headers-json-a2a-edit" />
+                        </div>
+                      </div>
+
+                      <!-- Query Parameter Auth Fields -->
+                      <div id="auth-query_param-fields-a2a-edit" style="display: none">
+                        <div class="p-3 mb-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-300 dark:border-amber-700 rounded-md">
+                          <p class="text-xs text-amber-700 dark:text-amber-400">
+                            <strong>Security Warning:</strong> API keys in URLs may appear in proxy logs, browser history, and server access logs.
+                            Consider using bearer tokens or headers instead (CWE-598).
+                          </p>
+                        </div>
+                        <div>
+                          <label
+                            class="block text-sm font-medium text-gray-700 dark:text-gray-300"
+                          >
+                            Query Parameter Name
+                          </label>
+                          <input
+                            type="text"
+                            name="auth_query_param_key"
+                            id="auth-query-param-key-a2a-edit"
+                            placeholder="e.g., api_key"
+                            class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
+                          />
+                        </div>
+                        <div class="mt-3">
+                          <label
+                            class="block text-sm font-medium text-gray-700 dark:text-gray-300"
+                          >
+                            Query Parameter Value
+                          </label>
+                          <div class="relative">
+                            <input
+                              type="password"
+                              name="auth_query_param_value"
+                              id="auth-query-param-value-a2a-edit"
+                              autocomplete="off"
+                              data-sensitive-label="API key"
+                              class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300 pr-16"
+                            />
+                            <button
+                              type="button"
+                              onclick="toggleInputMask('auth-query-param-value-a2a-edit', this)"
+                              class="absolute inset-y-0 right-0 mt-1 px-3 flex items-center text-sm text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+                            >
+                              Show
+                            </button>
+                          </div>
                         </div>
                       </div>
 
@@ -9822,6 +10547,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                             type="password"
                             name="oauth_client_secret"
                             id="oauth-client-secret-a2a-edit"
+                            autocomplete="off"
                             class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                             placeholder="Leave empty for auto-registration via DCR"
                           />
@@ -9844,6 +10570,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                             type="text"
                             name="oauth_username"
                             id="oauth-username-a2a-edit"
+                            autocomplete="off"
                             class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                             placeholder="systemadmin@system.com"
                           />
@@ -9866,6 +10593,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                             type="password"
                             name="oauth_password"
                             id="oauth-password-a2a-edit"
+                            autocomplete="off"
                             class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                             placeholder="Enter password"
                           />
@@ -10542,6 +11270,82 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                   </div>
                 </div>
 
+                <!-- OAuth 2.0 Configuration Section (RFC 9728) -->
+                <div class="mt-6 border-t border-gray-200 dark:border-gray-700 pt-4">
+                  <div class="flex items-center mb-4">
+                    <input
+                      type="checkbox"
+                      name="oauth_enabled"
+                      id="edit-server-oauth-enabled"
+                      class="form-checkbox h-5 w-5 text-indigo-600 dark:bg-gray-800 dark:border-gray-600"
+                      onchange="document.getElementById('edit-server-oauth-config-section').classList.toggle('hidden', !this.checked)"
+                    />
+                    <label
+                      for="edit-server-oauth-enabled"
+                      class="ml-2 text-sm font-medium text-gray-700 dark:text-gray-400"
+                      >Enable OAuth 2.0 for MCP Client Authentication</label
+                    >
+                  </div>
+                  <p class="text-xs text-gray-500 dark:text-gray-400 mb-3">
+                    When enabled, MCP clients can authenticate using browser-based OAuth/SSO per RFC 9728.
+                  </p>
+
+                  <!-- OAuth Configuration Fields (hidden by default) -->
+                  <div id="edit-server-oauth-config-section" class="hidden space-y-4 pl-6 border-l-2 border-indigo-200 dark:border-indigo-800">
+                    <div>
+                      <label
+                        class="block text-sm font-medium text-gray-700 dark:text-gray-400"
+                        for="edit-server-oauth-authorization-server"
+                        >Authorization Server URL</label
+                      >
+                      <input
+                        type="url"
+                        name="oauth_authorization_server"
+                        id="edit-server-oauth-authorization-server"
+                        placeholder="https://idp.example.com"
+                        class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
+                      />
+                      <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                        The OAuth 2.0 authorization server URL (e.g., your Identity Provider)
+                      </p>
+                    </div>
+                    <div>
+                      <label
+                        class="block text-sm font-medium text-gray-700 dark:text-gray-400"
+                        for="edit-server-oauth-scopes"
+                        >Scopes (space-separated)</label
+                      >
+                      <input
+                        type="text"
+                        name="oauth_scopes"
+                        id="edit-server-oauth-scopes"
+                        placeholder="openid profile email"
+                        class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
+                      />
+                      <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                        OAuth scopes to request (e.g., openid profile email)
+                      </p>
+                    </div>
+                    <div>
+                      <label
+                        class="block text-sm font-medium text-gray-700 dark:text-gray-400"
+                        for="edit-server-oauth-token-endpoint"
+                        >Token Endpoint URL (optional)</label
+                      >
+                      <input
+                        type="url"
+                        name="oauth_token_endpoint"
+                        id="edit-server-oauth-token-endpoint"
+                        placeholder="https://idp.example.com/oauth/token"
+                        class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
+                      />
+                      <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                        Leave blank to use standard discovery from authorization server
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
                   <div
                     class="mt-6 flex justify-end space-x-3 bg-white dark:bg-gray-900 dark:text-gray-100"
                   >
@@ -10853,6 +11657,122 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
           </div>
         </div>
       </div>
+
+      <!-- Root Details Modal -->
+      <div
+        id="root-details-modal"
+        class="fixed z-10 inset-0 overflow-y-auto hidden"
+      >
+        <div
+          class="flex items-end justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0"
+        >
+          <div class="fixed inset-0 transition-opacity" aria-hidden="true">
+            <div class="absolute inset-0 bg-gray-500 opacity-75"></div>
+          </div>
+          <div
+            class="inline-block align-bottom bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-4xl sm:w-full"
+          >
+            <div
+              class="bg-white dark:bg-gray-900 px-4 pt-5 pb-4 sm:p-6 sm:pb-4"
+            >
+              <h3 class="text-lg font-medium text-gray-900 dark:text-gray-100">
+                Root Details
+              </h3>
+              <div
+                class="mt-4 space-y-4 bg-white dark:bg-gray-400"
+                id="root-details"
+              ></div>
+            </div>
+            <div
+              class="bg-gray-50 dark:bg-gray-700 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse"
+            >
+              <button
+                type="button"
+                onclick="closeModal('root-details-modal')"
+                class="mt-3 w-full inline-flex justify-center rounded-md border border-gray-300 shadow-sm px-4 py-2 bg-white text-base font-medium text-gray-700 hover:bg-gray-50 dark:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 sm:mt-0 sm:ml-3 sm:w-auto sm:text-sm dark:text-gray-300"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Root Edit Modal -->
+      <div
+        id="root-edit-modal"
+        class="fixed z-10 inset-0 overflow-y-auto hidden"
+      >
+        <div
+          class="flex items-end justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0"
+        >
+          <div class="fixed inset-0 transition-opacity" aria-hidden="true">
+            <div class="absolute inset-0 bg-gray-500 opacity-75"></div>
+          </div>
+          <div
+            class="inline-block align-bottom bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-4xl sm:w-full"
+          >
+            <div
+              class="bg-white dark:bg-gray-900 px-4 pt-5 pb-4 sm:p-6 sm:pb-4"
+            >
+              <h3 class="text-lg font-medium text-gray-900 dark:text-gray-100">
+                Edit Root
+              </h3>
+              <div class="mt-4">
+                <form id="edit-root-form" method="POST">
+                  <div class="grid grid-cols-1 gap-7">
+                    <div>
+                      <label class="block text-sm font-medium text-gray-700"
+                        >URI</label
+                      >
+                      <!-- URI is read-only -->
+                      <input
+                        type="text"
+                        name="uri"
+                        required
+                        id="edit-root-uri"
+                        readonly
+                        class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
+                      />
+                    </div>
+                    <div class="relative">
+                      <label
+                        class="block text-sm font-medium text-gray-700"
+                        for="edit-root-name"
+                        >Name</label
+                      >
+                      <input
+                        type="text"
+                        name="name"
+                        required
+                        id="edit-root-name"
+                        class="mt-1 px-1.5 block w-full rounded-md border border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
+                      />
+                    </div>
+                  </div>
+                  <div
+                    class="mt-6 flex justify-end space-x-3 bg-white dark:bg-gray-900 dark:text-gray-100"
+                  >
+                    <button
+                      type="button"
+                      onclick="closeModal('root-edit-modal')"
+                      class="px-4 py-2 border border-gray-300 shadow-sm text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 dark:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 dark:text-gray-300"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      class="inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+                    >
+                      Save Changes
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
     <!-- Scripts -->
     <script>
       // User creation form event handler
@@ -10897,6 +11817,9 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
       window.MCPGATEWAY_UI_TOOL_TEST_TIMEOUT = {{ mcpgateway_ui_tool_test_timeout | tojson }};
       window.CURRENT_USER = {{ current_user | tojson }};
       window.IS_ADMIN = {{ is_admin | tojson }};
+      window.UI_HIDDEN_SECTIONS = {{ ui_hidden_sections | default([]) | tojson }};
+      window.UI_HIDDEN_HEADER_ITEMS = {{ ui_hidden_header_items | default([]) | tojson }};
+      window.UI_HIDDEN_TABS = {{ ui_hidden_tabs | default([]) | tojson }};
 
       // Display flash messages from URL parameters
       (function() {
@@ -10925,20 +11848,12 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
             const cleanUrl = new URL(window.location);
             cleanUrl.searchParams.delete('error');
             cleanUrl.searchParams.delete('success');
-            window.history.replaceState({}, '', cleanUrl);
+            safeReplaceState({}, '', cleanUrl);
           }, 5000);
         }
       })();
 
-      // Tag filtering functionality moved to admin.js
-      function clearTagFilter(entityType) {
-        const input = document.getElementById(entityType + '-tag-filter');
-        input.value = '';
-        // Use the corrected filterEntitiesByTags function from admin.js
-        if (typeof filterEntitiesByTags === 'function') {
-          filterEntitiesByTags(entityType, '');
-        }
-      }
+      // Tag filtering functionality is implemented in admin.js.
 
 
       // Team context switching functions
@@ -11022,13 +11937,17 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
 
       function createRowElement(sectionType, item) {
         const row = document.createElement('tr');
+        // XSS SAFETY: All user-provided data is escaped via escapeHtml() before being inserted into innerHTML.
+        // This pattern (escape then innerHTML) is safe as long as escapeHtml() is always called on untrusted data.
+        // DO NOT remove escapeHtml() calls - they prevent XSS attacks from malicious database content.
+
 
         // Create row content based on section type
         if (sectionType === 'tools') {
           row.innerHTML = `
             <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">${escapeHtml(item.id)}</td>
             <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">${escapeHtml(item.name || item.customName || '')}</td>
-            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-300">${escapeHtml(item.description || '')}</td>
+            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-300">${escapeHtml(decodeHtml(item.description || ''))}</td>
             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-300">${escapeHtml(item.url || '')}</td>
             <td class="px-6 py-4 whitespace-nowrap">${createTagsSpan(item.tags)}</td>
             <td class="px-6 py-4 whitespace-nowrap">${createStatusSpan(item.isActive)}</td>
@@ -11038,7 +11957,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
           row.innerHTML = `
             <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">${escapeHtml(item.id)}</td>
             <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">${escapeHtml(item.name || '')}</td>
-            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-300">${escapeHtml(item.description || '')}</td>
+            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-300">${escapeHtml(decodeHtml(item.description || ''))}</td>
             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-300">${escapeHtml(item.uri || '')}</td>
             <td class="px-6 py-4 whitespace-nowrap">${createTagsSpan(item.tags)}</td>
             <td class="px-6 py-4 whitespace-nowrap">${createStatusSpan(item.isActive)}</td>
@@ -11049,7 +11968,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
           row.innerHTML = `
             <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">${escapeHtml(item.id)}</td>
             <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">${escapeHtml(item.name || '')}</td>
-            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-300">${escapeHtml(item.description || '')}</td>
+            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-300">${escapeHtml(decodeHtml(item.description || ''))}</td>
             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-300">${argsText}</td>
             <td class="px-6 py-4 whitespace-nowrap">${createTagsSpan(item.tags)}</td>
             <td class="px-6 py-4 whitespace-nowrap">${createStatusSpan(item.isActive)}</td>
@@ -11059,7 +11978,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
           row.innerHTML = `
             <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">${escapeHtml(item.id)}</td>
             <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">${escapeHtml(item.name || '')}</td>
-            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-300">${escapeHtml(item.description || '')}</td>
+            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-300">${escapeHtml(decodeHtml(item.description || ''))}</td>
             <td class="px-6 py-4 whitespace-nowrap">${createTagsSpan(item.tags)}</td>
             <td class="px-6 py-4 whitespace-nowrap">${createStatusSpan(item.isActive)}</td>
             <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">${createActionButtons(sectionType, item)}</td>
@@ -11081,7 +12000,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
             <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-700 dark:text-gray-300">${escapeHtml(item.id)}</td>
             <td class="px-6 py-4 whitespace-nowrap">
               <div class="text-sm font-medium text-gray-900 dark:text-gray-200">${escapeHtml(item.name || '')}</div>
-              <div class="text-sm text-gray-600 dark:text-gray-400">${escapeHtml(item.description || '')}</div>
+              <div class="text-sm text-gray-600 dark:text-gray-400">${escapeHtml(decodeHtml(item.description || ''))}</div>
               <div class="mt-1">
                 <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">${escapeHtml(item.ownerEmail || '')}</span>
                 <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800 ml-2">${escapeHtml(item.team || '')}</span>
@@ -11120,11 +12039,11 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
 
         const isActiveFlag = item.isActive || item.enabled || item.is_active;
         const activeButton = isActiveFlag ?
-          `<form method="POST" action="${window.ROOT_PATH}/admin/${backendPath}/${item.id}/toggle" class="inline mr-2" onsubmit="return handleToggleSubmit(event, '${sectionType}')">
+          `<form method="POST" action="${window.ROOT_PATH}/admin/${backendPath}/${item.id}/state" class="inline mr-2" onsubmit="return handleToggleSubmit(event, '${sectionType}')">
             <input type="hidden" name="activate" value="false" />
             <button type="submit" class="text-yellow-600 hover:text-yellow-900">Deactivate</button>
           </form>` :
-          `<form method="POST" action="${window.ROOT_PATH}/admin/${backendPath}/${item.id}/toggle" class="inline mr-2" onsubmit="return handleToggleSubmit(event, '${sectionType}')">
+          `<form method="POST" action="${window.ROOT_PATH}/admin/${backendPath}/${item.id}/state" class="inline mr-2" onsubmit="return handleToggleSubmit(event, '${sectionType}')">
             <input type="hidden" name="activate" value="true" />
             <button type="submit" class="text-blue-600 hover:text-blue-900">Activate</button>
           </form>`;
@@ -11289,7 +12208,8 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
         };
 
         // Add authentication if available
-        const token = localStorage.getItem('auth_token') || sessionStorage.getItem('auth_token');
+        let token = null;
+        try { token = localStorage.getItem('auth_token') || sessionStorage.getItem('auth_token'); } catch(e) { _logRestrictedContext(e); }
         if (token) {
           headers['Authorization'] = `Bearer ${token}`;
         }
@@ -11512,7 +12432,8 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
         };
 
         // Add authentication if available
-        const token = localStorage.getItem('auth_token') || sessionStorage.getItem('auth_token');
+        let token = null;
+        try { token = localStorage.getItem('auth_token') || sessionStorage.getItem('auth_token'); } catch(e) { _logRestrictedContext(e); }
         if (token) {
           headers['Authorization'] = `Bearer ${token}`;
         }
@@ -13547,9 +14468,11 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
             <form
               id="create-team-form"
               hx-post="{{ root_path }}/admin/teams"
-              hx-target="#unified-teams-list"
-              hx-swap="afterbegin"
+              hx-target="#create-team-error"
+              hx-swap="innerHTML"
+              data-team-validation="true"
             >
+              <div id="create-team-error" class="mb-4"></div>
               <div class="space-y-4">
                 <div>
                   <label
@@ -13567,7 +14490,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                     placeholder="Development Team"
                   />
                   <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                    Maximum 100 characters
+                    Letters, numbers, spaces, underscores, periods, and dashes only
                   </p>
                 </div>
 
@@ -13695,7 +14618,8 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
           >&#8203;</span
         >
         <div
-          class="inline-block align-bottom bg-white dark:bg-gray-800 rounded-lg px-4 pt-5 pb-4 text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-4xl sm:w-full sm:p-6"
+          class="inline-block align-bottom bg-white dark:bg-gray-800 rounded-lg px-4 pt-5 pb-4 text-left shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-4xl sm:w-full sm:p-6"
+          style="max-height: 90vh; overflow-y: auto"
         >
           <div id="team-edit-modal-content">
             <!-- Content will be loaded here -->
@@ -13812,6 +14736,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                   type="email"
                   id="invite-email"
                   name="email"
+                  autocomplete="off"
                   class="mt-1 px-1.5 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 dark:text-white"
                   placeholder="user@example.com"
                 />
@@ -13982,64 +14907,8 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
         document.getElementById('create-team-form').reset();
       }
 
-      // Filter functions for team list
-      let currentTeamFilter = 'all';
-      let currentSearchFilter = '';
-
-      function filterTeams(searchTerm) {
-        currentSearchFilter = searchTerm.toLowerCase();
-        applyTeamFilters();
-      }
-
-      function filterByRelationship(relationship) {
-        currentTeamFilter = relationship;
-
-        // Update active filter button
-        document.querySelectorAll('.filter-btn').forEach(btn => {
-          btn.classList.remove('active', 'bg-indigo-600', 'text-white');
-          btn.classList.add('bg-white', 'dark:bg-gray-700', 'text-gray-700', 'dark:text-gray-300');
-        });
-
-        const activeBtn = document.querySelector(`[data-filter="${relationship}"]`);
-        if (activeBtn) {
-          activeBtn.classList.add('active', 'bg-indigo-600', 'text-white');
-          activeBtn.classList.remove('bg-white', 'dark:bg-gray-700', 'text-gray-700', 'dark:text-gray-300');
-        }
-
-        applyTeamFilters();
-      }
-
-      function applyTeamFilters() {
-        const teamCards = document.querySelectorAll('.team-card');
-
-        teamCards.forEach(card => {
-          const teamName = card.querySelector('.team-name')?.textContent.toLowerCase() || '';
-          const teamDescription = card.querySelector('.team-description')?.textContent.toLowerCase() || '';
-          const relationshipBadge = card.querySelector('.relationship-badge')?.textContent.toLowerCase() || '';
-
-          // Check search filter
-          const matchesSearch = currentSearchFilter === '' ||
-                              teamName.includes(currentSearchFilter) ||
-                              teamDescription.includes(currentSearchFilter);
-
-          // Check relationship filter
-          let matchesRelationship = true;
-          if (currentTeamFilter === 'owner') {
-            matchesRelationship = relationshipBadge.includes('owner');
-          } else if (currentTeamFilter === 'member') {
-            matchesRelationship = relationshipBadge.includes('member') && !relationshipBadge.includes('owner');
-          } else if (currentTeamFilter === 'public') {
-            matchesRelationship = relationshipBadge.includes('join');
-          }
-          // 'all' filter shows everything
-
-          if (matchesSearch && matchesRelationship) {
-            card.style.display = 'block';
-          } else {
-            card.style.display = 'none';
-          }
-        });
-      }
+      // Filter functions for team list are defined in admin.js (filterTeams, filterByRelationship)
+      // to enable server-side search and pagination
 
       // Safe team action functions using data attributes
       function requestToJoinTeamSafe(button) {
@@ -14059,11 +14928,10 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
         const teamName = button.getAttribute('data-team-name');
         if (confirm(`Leave team "${teamName}"? You will lose access to team resources.`)) {
           htmx.ajax('POST', window.ROOT_PATH + '/admin/teams/' + teamId + '/leave', {
-            target: '#unified-teams-list',
-            swap: 'innerHTML'
-          }).then(() => {
-            initializeTeamManagement(); // Refresh the full list
+            target: 'body',
+            swap: 'none'
           });
+          // Backend HX-Trigger handles refresh with proper delay for DB commit
         }
       }
 
@@ -14108,22 +14976,20 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
         const teamName = button.getAttribute('data-team-name');
         if (confirm(`Delete team "${teamName}"? This action cannot be undone.`)) {
           htmx.ajax('DELETE', window.ROOT_PATH + '/admin/teams/' + teamId, {
-            target: '#unified-teams-list',
-            swap: 'innerHTML'
-          }).then(() => {
-            initializeTeamManagement(); // Refresh the full list
+            target: 'body',
+            swap: 'none'
           });
+          // Backend HX-Trigger handles refresh with proper delay for DB commit
         }
       }
 
       function cancelJoinRequest(teamId, requestId) {
         if (confirm('Cancel your join request?')) {
           htmx.ajax('DELETE', window.ROOT_PATH + '/admin/teams/' + teamId + '/join-request/' + requestId, {
-            target: '#unified-teams-list',
-            swap: 'innerHTML'
-          }).then(() => {
-            initializeTeamManagement(); // Refresh the full list
+            target: 'body',
+            swap: 'none'
           });
+          // Backend HX-Trigger handles refresh with proper delay for DB commit
         }
       }
 
@@ -14158,10 +15024,30 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
 
       // Initialize team management when teams tab is shown
       function initializeTeamManagement() {
-        // Load unified teams list
-        htmx.ajax('GET', window.ROOT_PATH + '/admin/teams?unified=true', {
+        // Load teams list using /teams/partial endpoint
+        // Get current search and filter state
+        const searchInput = document.getElementById('team-search');
+        const searchQuery = searchInput ? searchInput.value.trim() : '';
+        const activeFilterBtn = document.querySelector('.filter-btn.active');
+        const relationship = activeFilterBtn ? activeFilterBtn.getAttribute('data-filter') : 'all';
+
+        // Preserve current pagination state (use inline getPaginationParams)
+        const paginationState = getPaginationParams('teams');
+        const params = new URLSearchParams();
+        params.set('page', paginationState.page);
+        params.set('per_page', paginationState.perPage);
+        if (searchQuery) {
+          params.set('q', searchQuery);
+        }
+        if (relationship && relationship !== 'all') {
+          params.set('relationship', relationship);
+        }
+        const url = window.ROOT_PATH + '/admin/teams/partial?' + params.toString();
+
+        htmx.ajax('GET', url, {
           target: '#unified-teams-list',
-          swap: 'innerHTML'
+          swap: 'innerHTML',
+          indicator: '#teams-loading'
         });
       }
 
@@ -14170,6 +15056,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
         const teamsTab = document.getElementById('tab-teams');
         if (teamsTab) {
           teamsTab.addEventListener('click', function() {
+            // Always refresh teams when tab is clicked
             setTimeout(initializeTeamManagement, 100);
           });
         }
