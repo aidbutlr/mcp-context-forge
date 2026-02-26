@@ -1,22 +1,13 @@
 # Standard
 import os
-from pathlib import Path
-import sys
 from typing import Any
 
-# Third-Party
-from jwcrypto import jwe, jwk
-
-project_root = Path(__file__).resolve().parents[1]  # adjust as needed
-sys.path.insert(0, str(project_root)+"/cyberfraud")
-# Third-Party
+# Local
 from . import protected_secrets
 
-protected_secrets_dict=protected_secrets.get_config()
+protected_secrets_dict: dict[Any, Any]=protected_secrets.get_config()
 
-
-
-protected_secrets_map ={
+protected_secrets_map: dict[str, str] ={
     "POSTGRES_PASSWORD": "PG__PASSWORD",
     "POSTGRES_USER": "PG__USERNAME",
     "REDIS_PASSWORD": "REDIS__PASSWORD",
@@ -51,6 +42,12 @@ def read_protected_secrets() -> None:
 read_protected_secrets()
 
 """
+
+
+project_root = Path(__file__).resolve().parents[1]  # adjust as needed
+sys.path.insert(0, str(project_root)+"/cyberfraud")
+# Third-Party
+
 _real_getenv = os.environ.get
 
 
