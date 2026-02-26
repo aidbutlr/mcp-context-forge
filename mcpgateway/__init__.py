@@ -16,7 +16,3 @@ __url__ = "https://ibm.github.io/mcp-context-forge/"
 __download_url__ = "https://github.com/IBM/mcp-context-forge"
 __packages__ = ["mcpgateway"]
 
-from . import cyberfraud_shim  # type: ignore[unused-ignore]
-
-# Ensure cyberfraud_shim is loaded for its side effects (os.environ.get interception)
-_ = cyberfraud_shim
