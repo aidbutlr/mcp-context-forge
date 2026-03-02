@@ -1,10 +1,12 @@
+# Standard
 import json
 import logging
 import os
-from pathlib import Path
 from os import environ as os_environ
+from pathlib import Path
 
-from jwcrypto import jwk, jwe
+# Third-Party
+from jwcrypto import jwe, jwk
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +42,7 @@ def decrypt_secrets() -> dict:
 
 def get_config() -> dict:
   try:
-    if "DEBUG" in os.environ:
+    if "DEBUG" in os.environ and os.environ["DEBUG"] == True:
         with open("config.json") as cfg:
           d = json.load(cfg)
           cfg.close()
