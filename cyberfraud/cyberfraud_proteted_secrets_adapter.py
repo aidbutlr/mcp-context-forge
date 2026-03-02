@@ -10,12 +10,16 @@ protected_secrets_dict: dict[Any, Any]=protected_secrets.get_config()
 
 protected_secrets_map: dict[str, str] ={
     "POSTGRES_PASSWORD": "PG__PASSWORD",
-    "POSTGRES_USER": "PG__USER",
-    "POSTGRES_HOST": "PG__USER",
+    "POSTGRES_USER": "PG__USERNAME",
+    "POSTGRES_HOST": "PG__HOST",
     "POSTGRES_PORT": "PG__PORT",
+    "REDIS_HOST": "REDIS__HOST",
+    "REDIS_PORT": "REDIS__PORT",
     "REDIS_PASSWORD": "REDIS__PASSWORD",
-    "BASIC_AUTH_USER": "BASICAUTH__USERNAME",
-    "BASIC_AUTH_PASSWORD": "BASICAUTH__PASSWORD",
+    "BASIC_AUTH_USER": "systemadminuser__admin_username",
+    "BASIC_AUTH_PASSWORD": "systemadminuser__admin_password",
+    "PLATFORM_ADMIN_EMAIL": "systemadminuser__admin_email",
+    "PLATFORM_ADMIN_PASSWORD": "systemadminuser__admin_password"
     }
 
 
@@ -43,7 +47,7 @@ def read_protected_secrets() -> None:
                 value=""
                 print(f"Entry not found in Protected Secrets {node}")
                 break
-        os.environ[key]=value
+        os.environ[key]=str(value)
 
         
 read_protected_secrets()
