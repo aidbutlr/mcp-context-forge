@@ -9,7 +9,7 @@ from jwcrypto import jwk, jwe
 logger = logging.getLogger(__name__)
 
 def _get_conf() -> str:
-    conf_path = Path("/etc/cp4s/conf.json")
+    conf_path = Path("/var/run/creds/conf.json")
     if not conf_path.exists():
         return ""
     with conf_path.open() as fp:
@@ -18,7 +18,7 @@ def _get_conf() -> str:
 
 def _get_key_text() -> str:
     # key.jwk is in a random UUID dir
-    jwk_path = next(Path("/etc/cp4s").glob("*/key.jwk"))
+    jwk_path = next(Path("/var/run/creds").glob("*/key.jwk"))
     with jwk_path.open() as fp:
         key_text = fp.read()
     return key_text
