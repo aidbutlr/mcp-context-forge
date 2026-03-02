@@ -49,10 +49,12 @@ def read_protected_secrets() -> None:
                 break
         os.environ[key]=str(value)
         
-    os.environ["DATABASE_URL"] = os.path.expandvars(os.environ["DATABASE_URL"])
-    os.environ["REDIS_URL"] = os.path.expandvars(os.environ["REDIS_URL"])
-    print(f"REDIS_URL: {os.environ['REDIS_URL']}")
-    print(f"DATABASE_URL: {os.environ['DATABASE_URL']}")
+    if os.environ["DATABASE_URL"]:
+        os.environ["DATABASE_URL"] = os.path.expandvars(os.environ["DATABASE_URL"])
+        print(f"DATABASE_URL: {os.environ['DATABASE_URL']}")
+    if os.environ["REDIS_URL"]:
+        os.environ["REDIS_URL"] = os.path.expandvars(os.environ["REDIS_URL"])
+        print(f"REDIS_URL: {os.environ['REDIS_URL']}")
 
         
 read_protected_secrets()
