@@ -8,7 +8,6 @@ from . import protected_secrets
 protected_secrets_dict: dict[Any, Any]=protected_secrets.get_config()
 
 
-pg/host
 protected_secrets_map: dict[str, str] ={
     "POSTGRES_PASSWORD": "PG__PASSWORD",
     "POSTGRES_USER": "PG__USER",
