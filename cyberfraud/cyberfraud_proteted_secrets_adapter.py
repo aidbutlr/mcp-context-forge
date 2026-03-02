@@ -7,9 +7,13 @@ from . import protected_secrets
 
 protected_secrets_dict: dict[Any, Any]=protected_secrets.get_config()
 
+
+pg/host
 protected_secrets_map: dict[str, str] ={
     "POSTGRES_PASSWORD": "PG__PASSWORD",
-    "POSTGRES_USER": "PG__USERNAME",
+    "POSTGRES_USER": "PG__USER",
+    "POSTGRES_HOST": "PG__USER",
+    "POSTGRES_PORT": "PG__PORT",
     "REDIS_PASSWORD": "REDIS__PASSWORD",
     "BASIC_AUTH_USER": "BASICAUTH__USERNAME",
     "BASIC_AUTH_PASSWORD": "BASICAUTH__PASSWORD",
@@ -20,11 +24,15 @@ def read_protected_secrets() -> None:
     """Load protected secrets from cyberfraud config into environment variables.
     
     Reads secrets from the protected_secrets_dict using paths defined in
-    protected_secrets_map and sets them as environment variables. 
+    protected_secrets_map and sets them as environment variables.
     """
+    print("Protected secrets map:")
+    for env_var, secret_path in protected_secrets_map.items():
+        print(f"  {env_var} -> {secret_path}")
     for key in protected_secrets_map:
         print(f">>>>Getting Protected Secret {key}")
         ps_path = protected_secrets_map[key]
+        ps_path = ps_path.lower()
         nodes: list[str] = ps_path.split(sep="__")
         value =""
         loc: Any =protected_secrets_dict
