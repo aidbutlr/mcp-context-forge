@@ -48,8 +48,9 @@ def read_protected_secrets() -> None:
                 print(f"Entry not found in Protected Secrets {node}")
                 break
         os.environ[key]=str(value)
-    os.environ["DATABASE_URL"] = os.environ["DATABASE_URL"]
-    os.environ["REDIS_URL"] = os.environ["REDIS_URL"]
+        
+    os.environ["DATABASE_URL"] = os.path.expandvars(os.environ["DATABASE_URL"])
+    os.environ["REDIS_URL"] = os.path.expandvars(os.environ["REDIS_URL"])
     print(f"REDIS_URL: {os.environ['REDIS_URL']}")
     print(f"DATABASE_URL: {os.environ['DATABASE_URL']}")
 
