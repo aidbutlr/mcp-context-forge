@@ -24,6 +24,7 @@ import platform
 if platform.system() == "Darwin":
     os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
 
+# First-Party
 # Import Pydantic Settings singleton
 from mcpgateway.config import settings
 
