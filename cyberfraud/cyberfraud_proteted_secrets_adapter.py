@@ -10,7 +10,7 @@ from . import protected_secrets
 logging_service = LoggingService()
 logger = logging_service.get_logger(__name__)
 
-protected_secrets_dict: dict[Any, Any]=protected_secrets.get_config()
+protected_secrets_dict: dict[Any, Any] = protected_secrets.get_config()
 
 
 protected_secrets_to_env_map: dict[str, str] ={
@@ -41,17 +41,17 @@ def read_protected_secrets() -> None:
         ps_path = protected_secrets_to_env_map[key]
         ps_path = ps_path.lower()
         nodes: list[str] = ps_path.split(sep="__")
-        value =""
-        loc: Any =protected_secrets_dict
+        value = ""
+        loc: Any = protected_secrets_dict
         for node in nodes:
             if node in loc:
-                loc: Any = loc[node]
-                value: Any = loc
+                loc = loc[node]
+                value = loc
             else:
-                value=""
+                value = ""
                 logger.debug(f"Entry not found in Protected Secrets {node}")
                 break
-        os.environ[key]=str(value)
+        os.environ[key] = str(value)
         
     if "DATABASE_URL" in os.environ:
         os.environ["DATABASE_URL"] = os.path.expandvars(os.environ["DATABASE_URL"])
@@ -61,6 +61,8 @@ def read_protected_secrets() -> None:
         logger.debug(f"REDIS_URL: {os.environ['REDIS_URL']}")
 
 
-if "USE_PROTECTED_SECRETS" in os.environ and os.environ["USE_PROTECTED_SECRETS"] == "True" :
-    logger.info(f"Initializing Protected Secrets")
+if os.environ.get("USE_PROTECTED_SECRETS", "").lower() == "true":
+    logger.info("Initializing Protected Secrets")
     read_protected_secrets()
+else:
+    logger.info("Protected Secrets Disabled")
