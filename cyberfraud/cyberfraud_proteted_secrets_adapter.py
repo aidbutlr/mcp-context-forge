@@ -1,14 +1,17 @@
 # Standard
+import logging
 import os
 from typing import Any
 
 # Local
 from . import protected_secrets
 
+logger = logging.getLogger(__name__)
+
 protected_secrets_dict: dict[Any, Any]=protected_secrets.get_config()
 
 
-protected_secrets_map: dict[str, str] ={
+protected_secrets_to_env_map: dict[str, str] ={
     "POSTGRES_PASSWORD": "PG__PASSWORD",
     "POSTGRES_USER": "PG__USERNAME",
     "POSTGRES_HOST": "PG__HOST",
@@ -24,17 +27,16 @@ protected_secrets_map: dict[str, str] ={
 
 
 def read_protected_secrets() -> None:
-    """Load protected secrets from cyberfraud config into environment variables.
-    
-    Reads secrets from the protected_secrets_dict using paths defined in
-    protected_secrets_map and sets them as environment variables.
     """
-    print("Protected secrets map:")
-    for env_var, secret_path in protected_secrets_map.items():
-        print(f"  {env_var} -> {secret_path}")
-    for key in protected_secrets_map:
-        print(f">>>>Getting Protected Secret {key}")
-        ps_path = protected_secrets_map[key]
+    Reads secrets from the protected_secrets_dict using paths defined in
+    protected_secrets_to_env_map and sets them as environment variables.
+    """
+    logger.debug("Populating env from protected secrets")
+    for env_var, secret_path in protected_secrets_to_env_map.items():
+        logger.debug(f"  {env_var} -> {secret_path}")
+    for key in protected_secrets_to_env_map:
+        logger.debug(f"Getting Protected Secret {key}")
+        ps_path = protected_secrets_to_env_map[key]
         ps_path = ps_path.lower()
         nodes: list[str] = ps_path.split(sep="__")
         value =""
@@ -45,16 +47,16 @@ def read_protected_secrets() -> None:
                 value: Any = loc
             else:
                 value=""
-                print(f"Entry not found in Protected Secrets {node}")
+                logger.debug(f"Entry not found in Protected Secrets {node}")
                 break
         os.environ[key]=str(value)
         
     if "DATABASE_URL" in os.environ:
         os.environ["DATABASE_URL"] = os.path.expandvars(os.environ["DATABASE_URL"])
-        print(f"DATABASE_URL: {os.environ['DATABASE_URL']}")
+        logger.debug(f"DATABASE_URL: {os.environ['DATABASE_URL']}")
     if "REDIS_URL" in os.environ:
         os.environ["REDIS_URL"] = os.path.expandvars(os.environ["REDIS_URL"])
-        print(f"REDIS_URL: {os.environ['REDIS_URL']}")
+        logger.debug(f"REDIS_URL: {os.environ['REDIS_URL']}")
 
 
 if "USE_PROTECTED_SECRETS" in os.environ and os.environ["USE_PROTECTED_SECRETS"] == "True" :
