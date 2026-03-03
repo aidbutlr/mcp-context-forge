@@ -18,7 +18,7 @@ protected_secrets_to_env_map: dict[str, str] ={
     "POSTGRES_HOST": "PG__HOST",
     "POSTGRES_PORT": "PG__PORT",
     "REDIS_HOST": "REDIS__HOST",
-    "REDIS_PORT": "REDIS__PORT",
+    #"REDIS_PORT": "REDIS__PORT",
     "REDIS_PASSWORD": "REDIS__PASSWORD",
     "BASIC_AUTH_USER": "systemadminuser__admin_username",
     "BASIC_AUTH_PASSWORD": "systemadminuser__admin_password",
