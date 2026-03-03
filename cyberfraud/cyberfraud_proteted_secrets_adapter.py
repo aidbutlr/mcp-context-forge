@@ -1,12 +1,14 @@
 # Standard
-import logging
 import os
 from typing import Any
 
+# First-Party
+from mcpgateway.services.logging_service import LoggingService
 # Local
 from . import protected_secrets
 
-logger = logging.getLogger(__name__)
+logging_service = LoggingService()
+logger = logging_service.get_logger(__name__)
 
 protected_secrets_dict: dict[Any, Any]=protected_secrets.get_config()
 
@@ -60,4 +62,5 @@ def read_protected_secrets() -> None:
 
 
 if "USE_PROTECTED_SECRETS" in os.environ and os.environ["USE_PROTECTED_SECRETS"] == "True" :
+    logger.info(f"Initializing Protected Secrets")
     read_protected_secrets()
