@@ -1,9 +1,12 @@
 # Standard
+import logging
 import os
 from typing import Any
 
 # Local
 from . import protected_secrets
+
+logger = logging.getLogger(__name__)
 
 protected_secrets_dict: dict[Any, Any] = protected_secrets.get_config()
 
@@ -27,7 +30,11 @@ def read_protected_secrets() -> None:
     Reads secrets from the protected_secrets_dict using paths defined in
     protected_secrets_to_env_map and sets them as environment variables.
     """
+    logger.info("Populating env from protected secrets")
+    for env_var, secret_path in protected_secrets_to_env_map.items():
+        logger.info("  %s -> %s", env_var, secret_path)
     for key in protected_secrets_to_env_map:
+        logger.info("Getting Protected Secret %s", key)
         ps_path = protected_secrets_to_env_map[key]
         ps_path = ps_path.lower()
         nodes: list[str] = ps_path.split(sep="__")
@@ -39,17 +46,20 @@ def read_protected_secrets() -> None:
                 value = loc
             else:
                 value = ""
+                logger.info("Entry not found in Protected Secrets %s", node)
                 break
         os.environ[key] = str(value)
         
     if "DATABASE_URL" in os.environ:
         os.environ["DATABASE_URL"] = os.path.expandvars(os.environ["DATABASE_URL"])
+        logger.info("DATABASE_URL updated")
     if "REDIS_URL" in os.environ:
         os.environ["REDIS_URL"] = os.path.expandvars(os.environ["REDIS_URL"])
+        logger.info("REDIS_URL updated")
 
 
 if os.environ.get("USE_PROTECTED_SECRETS", "").lower() == "true":
-    print("Initializing Protected Secrets")
+    logger.info("Initializing Protected Secrets")
     read_protected_secrets()
 else:
-    print("Protected Secrets Disabled")
+    logger.info("Protected Secrets Disabled")
