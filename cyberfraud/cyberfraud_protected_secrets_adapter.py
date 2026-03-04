@@ -8,6 +8,7 @@ from mcpgateway.services.logging_service import LoggingService
 from . import protected_secrets
 
 logging_service = LoggingService()
+logging_service.initialize()
 logger = logging_service.get_logger(__name__)
 
 protected_secrets_dict: dict[Any, Any] = protected_secrets.get_config()
