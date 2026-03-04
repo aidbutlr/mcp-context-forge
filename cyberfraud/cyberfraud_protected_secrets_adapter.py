@@ -7,6 +7,7 @@ from mcpgateway.services.logging_service import LoggingService
 # Local
 from . import protected_secrets
 
+print("In adapter")
 logging_service = LoggingService()
 logging_service.initialize()
 logger = logging_service.get_logger(__name__)
@@ -35,6 +36,7 @@ def read_protected_secrets() -> None:
     protected_secrets_to_env_map and sets them as environment variables.
     """
     logger.info("Populating env from protected secrets")
+    print("Populating env from protected secrets")
     for env_var, secret_path in protected_secrets_to_env_map.items():
         logger.info(f"  {env_var} -> {secret_path}")
     for key in protected_secrets_to_env_map:
@@ -63,7 +65,9 @@ def read_protected_secrets() -> None:
 
 
 if os.environ.get("USE_PROTECTED_SECRETS", "").lower() == "true":
+    print("Initializing Protected Secrets")
     logger.info("Initializing Protected Secrets")
     read_protected_secrets()
 else:
-    logger.info("Protected Secrets Disabled")
+    print("Protected Secrets Disabled")
+    logger.info("Protected Secrets Disabled")    
