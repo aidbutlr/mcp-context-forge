@@ -15,4 +15,3 @@ __description__ = "IBM Consulting Assistants - Extensions API Library"
 __url__ = "https://ibm.github.io/mcp-context-forge/"
 __download_url__ = "https://github.com/IBM/mcp-context-forge"
 __packages__ = ["mcpgateway"]
-
