@@ -1,12 +1,24 @@
 # Standard
 import logging
 import os
+import sys
 from typing import Any
 
 # Local
 from . import protected_secrets
 
+# Configure logging to ensure output appears in console
 logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S"
+        )
+    )
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 protected_secrets_dict: dict[Any, Any] = protected_secrets.get_config()
 
