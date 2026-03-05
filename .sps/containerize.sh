@@ -48,7 +48,7 @@ DOCKER_REGISTRY=$(get_env artifactory-docker-full-url "docker-na.artifactory.swg
 
 
 MULTI_ARCH_BUILD=$(get_env multi-arch-build "1")
-if [ $MULTI_ARCH_BUILD == "0" ]; then
+if [ $MULTI_ARCH_BUILD == "1" ]; then
    echo "Building multi architecture image"
    BASE_IMAGE_REPO="${DOCKER_REGISTRY}/${IMAGE_BASE}:${BASE_IMAGE_TAG}"
    sed -i "s%BASE_IMAGE_REPO%${BASE_IMAGE_REPO}%g" Containerfile.cyberfraud
