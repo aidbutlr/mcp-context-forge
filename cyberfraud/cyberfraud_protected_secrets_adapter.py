@@ -62,12 +62,12 @@ def read_protected_secrets() -> None:
                 break
         os.environ[key] = str(value)
         
-    if "DATABASE_URL" in os.environ:
-        os.environ["DATABASE_URL"] = os.path.expandvars(os.environ["DATABASE_URL"])
-        logger.info("DATABASE_URL updated")
-    if "REDIS_URL" in os.environ:
-        os.environ["REDIS_URL"] = os.path.expandvars(os.environ["REDIS_URL"])
-        logger.info("REDIS_URL updated")
+    db_url_template= 'postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}'
+    os.environ["DATABASE_URL"] = os.path.expandvars(db_url_template)
+    logger.info("DATABASE_URL updated")
+    redis_url_template = 'redis://:${REDIS_PASSWORD}@${REDIS_HOST}:${REDIS_PORT}/0'
+    os.environ["REDIS_URL"] = os.path.expandvars(redis_url_template)
+    logger.info("REDIS_URL updated")
 
 
 if os.environ.get("USE_PROTECTED_SECRETS", "").lower() == "true":
